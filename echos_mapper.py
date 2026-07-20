@@ -192,17 +192,27 @@ class OccupancyMapper:
 
         ix0, iy0 = self.w2g(ex, ey)
         ix1, iy1 = self.w2g(end_x, end_y)
-        n = max(abs(ix1 - ix0) + 1, abs(iy1 - iy0) + 1)
+        dx = abs(ix1 - ix0) + 1
+        dy = abs(iy1 - iy0) + 1
+        n = max(dx, dy)
+        cr = self.clear_r
 
         for i in range(n + 1):
             t = i / max(n, 1)
             cx = int(round(ix0 + t * (ix1 - ix0)))
             cy = int(round(iy0 + t * (iy1 - iy0)))
             term = (i >= n - 1 and is_hit)
-            if self.in_bounds(cx, cy):
-                self.views[cy, cx] += 1
-                if term:
-                    self.hits[cy, cx] += 1
+            for ddx in range(-cr, cr + 1):
+                for ddy in range(-cr, cr + 1):
+                    nx, ny = cx + ddx, cy + ddy
+                    if not self.in_bounds(nx, ny):
+                        continue
+                    dist = abs(ddx) + abs(ddy)
+                    if dist > cr:
+                        continue
+                    self.views[ny, nx] += 1
+                    if term and dist <= 1:
+                        self.hits[ny, nx] += 1
 
     def get_map(self):
         occ = np.zeros((self.h, self.w))

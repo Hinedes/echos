@@ -17,49 +17,39 @@ scene.add_entity(gs.morphs.Plane())
 
 argus_flood = scene.add_sensor(gs.sensors.Raycaster(
     pattern=gs.sensors.SphericalPattern(fov=(60.0, 0.0), n_points=(7, 1)),
-    entity_idx=body.idx, pos_offset=EMIT_OFFSET, euler_offset=(0.0, 0.0, 0.0),
-    max_range=5.0, no_hit_value=-1.0))
+    entity_idx=body.idx, pos_offset=(RAYCAST_ORIGIN, 0.0, 0.0),
+    euler_offset=(0.0, 0.0, 0.0), max_range=5.0, no_hit_value=-1.0))
 argus_throw = scene.add_sensor(gs.sensors.Raycaster(
     pattern=gs.sensors.SphericalPattern(angles=(np.array([0.0]), np.array([0.0]))),
-    entity_idx=body.idx, pos_offset=EMIT_OFFSET, euler_offset=(0.0, 0.0, 0.0),
-    max_range=8.0, no_hit_value=-1.0))
+    entity_idx=body.idx, pos_offset=(RAYCAST_ORIGIN, 0.0, 0.0),
+    euler_offset=(0.0, 0.0, 0.0), max_range=8.0, no_hit_value=-1.0))
 
 scene.build()
 body.set_mass(MASS)
 rs = scene.sim.rigid_solver
 li = 0
 
-def reset_body(pos=(0.0, 0.0, 1.0), quat=None):
-    body.set_pos(pos)
-    body.set_quat(quat if quat is not None else np.array([1.0, 0.0, 0.0, 0.0]))
-    rs.clear_external_force()
-
 
 def run_mapping_mission():
     print(f"\n{'='*50}")
     print(f"  2D Occupancy Grid Mapping")
     print(f"{'='*50}")
-    print(f"  L-corridor: horizontal = vertical")
-    print(f"  FLOOD continuous, THROW occasional")
 
-    reset_body(pos=(0.0, 0.0, 1.0))
+    reset_body_state(body, rs, pos=(0.0, 0.0, 1.0))
     for _ in range(20):
         rs.clear_external_force()
-        qc = body.get_quat().cpu().numpy()
-        p = body.get_pos().cpu().numpy()
-        v = body.get_vel().cpu().numpy()
-        om = body.get_ang().cpu().numpy()
+        qc = body.get_quat().cpu().numpy(); p = body.get_pos().cpu().numpy()
+        v = body.get_vel().cpu().numpy(); om = body.get_ang().cpu().numpy()
         Tt, qd = position_pd(np.array([0.0, 0.0, 1.0]), p, v)
-        ta, _ = attitude_pd(qd, qc, om)
-        apply_rotor_forces(rs, li, np.clip(mixer(Tt, ta[0], ta[1], ta[2])[0], 0.0, None))
+        tau, _ = attitude_pd(qd, qc, om)
+        ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
+        apply_rotor_forces(rs, li, ts)
         scene.step()
 
     mx, mxx, my, myy = -2.0, 7.0, -2.0, 5.0
     mapper = OccupancyMapper((mx, mxx, my, myy), resolution=0.08)
 
-    eps = 0.004
     az_deg = np.linspace(-30, 30, 7)
-
     waypoints = [np.array([5.0, 0.0, 1.0]), np.array([5.0, 2.5, 1.0])]
     wp_idx = 0
     target = waypoints[0].copy()
@@ -69,21 +59,16 @@ def run_mapping_mission():
 
     for step in range(max_steps):
         rs.clear_external_force()
-        q_cur = body.get_quat().cpu().numpy()
-        pos = body.get_pos().cpu().numpy()
-        vel = body.get_vel().cpu().numpy()
-        omega_w = body.get_ang().cpu().numpy()
+        q_cur = body.get_quat().cpu().numpy(); pos = body.get_pos().cpu().numpy()
+        vel = body.get_vel().cpu().numpy(); omega_w = body.get_ang().cpu().numpy()
 
-        df = argus_flood.read()
-        raw_f = df.distances.cpu().numpy().flatten()
-
+        df = argus_flood.read(); raw_f = df.distances.cpu().numpy().flatten()
         is_throw = (step % 5 == 0)
         if is_throw:
-            dt = argus_throw.read()
-            raw_t = dt.distances.flatten()[0].item()
+            dt = argus_throw.read(); raw_t = dt.distances.flatten()[0].item()
 
         Rwb = R_world_from_body(q_cur)
-        emitter_w = pos + Rwb @ np.array([EMIT_OFFSET[0], 0.0, 0.0])
+        ew = pos + Rwb @ np.array([RAYCAST_ORIGIN, 0.0, 0.0])
 
         target = waypoints[min(wp_idx, len(waypoints)-1)].copy()
         if np.linalg.norm(pos[:2] - target[:2]) < 0.25:
@@ -91,29 +76,24 @@ def run_mapping_mission():
                 wp_idx += 1
 
         for i in range(7):
-            az = np.radians(az_deg[i])
-            d_body = np.array([np.cos(az), np.sin(az), 0.0])
-            d_world = Rwb @ d_body
-            is_hit = raw_f[i] >= 0
-            raw_r = raw_f[i] if is_hit else 0.0
-            mapper.update_ray(emitter_w, d_world, raw_r, 5.0, is_hit, eps)
-            ray_log.append((step, "FLOOD", i, az_deg[i], pos.copy(), q_cur.copy(), raw_r if is_hit else -1.0, is_hit))
+            az = np.radians(az_deg[i]); db = np.array([np.cos(az), np.sin(az), 0.0])
+            dw = Rwb @ db; hit = raw_f[i] >= 0; rr = raw_f[i] if hit else 0.0
+            mapper.update_ray(ew, dw, rr, 5.0, hit)
+            ray_log.append((step, "FLOOD", i, az_deg[i], pos.copy(), q_cur.copy(), rr if hit else -1.0, hit))
 
         if is_throw:
-            d_world_t = Rwb @ np.array([1.0, 0.0, 0.0])
-            is_hit_t = raw_t >= 0
-            mapper.update_ray(emitter_w, d_world_t, raw_t if is_hit_t else 0.0, 8.0, is_hit_t, eps)
-            ray_log.append((step, "THROW", 0, 0.0, pos.copy(), q_cur.copy(), raw_t if is_hit_t else -1.0, is_hit_t))
+            dwt = Rwb @ np.array([1.0, 0.0, 0.0]); htt = raw_t >= 0
+            mapper.update_ray(ew, dwt, raw_t if htt else 0.0, 8.0, htt)
+            ray_log.append((step, "THROW", 0, 0.0, pos.copy(), q_cur.copy(), raw_t if htt else -1.0, htt))
 
         T_total, q_des = position_pd(target, pos, vel)
         tau, _ = attitude_pd(q_des, q_cur, omega_w)
-        thrusts = mixer(T_total, tau[0], tau[1], tau[2])[0]
-        apply_rotor_forces(rs, li, np.clip(thrusts, 0.0, None))
+        ts, sat, _ = mixer_with_authority(T_total, tau[0], tau[1], tau[2])
+        apply_rotor_forces(rs, li, ts)
         scene.step()
 
         pos = body.get_pos().cpu().numpy()
         trajectory.append(pos.copy())
-
         if wp_idx >= len(waypoints) and np.linalg.norm(pos[:2] - target[:2]) < 0.3:
             if step > 3000:
                 break
@@ -149,37 +129,30 @@ def run_mapping_mission():
             return True
         return False
 
-    tp_occ = fp_occ = tp_free = fp_free = total = 0
+    # Confusion matrix
+    tp = fp = tn = fn = 0
     for iy in range(mapper.h):
         for ix in range(mapper.w):
             wx, wy = mapper.g2w(ix, iy)
             g_wall = in_gt(wx, wy)
             g_free = in_free(wx, wy)
-            is_occ = occ_map[iy, ix] == 1.0
-            is_free = occ_map[iy, ix] == 0.5
+            pred_occ = occ_map[iy, ix] == 1.0
+            pred_free = occ_map[iy, ix] == 0.5
             seen = mapper.views[iy, ix] > 0
-            if not g_wall and not g_free:
-                continue
-            if not seen:
-                continue
-            total += 1
+            if not seen: continue
+            if not g_wall and not g_free: continue
             if g_wall:
-                if is_occ: tp_occ += 1
-                else: fp_occ += 1
+                if pred_occ: tp += 1
+                else: fp += 1
             if g_free:
-                if is_free: tp_free += 1
-                else: fp_free += 1
+                if pred_free: tn += 1
+                else: fn += 1
 
-    occ_prec = tp_occ / (tp_occ + fp_occ) * 100 if (tp_occ + fp_occ) > 0 else 0
-    free_prec = tp_free / (tp_free + fp_free) * 100 if (tp_free + fp_free) > 0 else 0
-    print(f"  Grid: {mapper.w}x{mapper.h} cells ({mapper.res:.2f} m)")
-    print(f"  Occupied precision: {tp_occ}/{tp_occ+fp_occ} = {occ_prec:.1f}%")
-    print(f"  Free-space precision: {tp_free}/{tp_free+fp_free} = {free_prec:.1f}%")
-
-    np.savez_compressed("/workspace/occupancy_map.npz",
-                        grid=occ_map, hits=mapper.hits, views=mapper.views,
-                        bounds=np.array([mx, mxx, my, myy]), resolution=mapper.res)
-    print(f"  Saved: /workspace/occupancy_map.npz")
+    occ_prec = tp / (tp + fp) * 100 if tp + fp > 0 else 0
+    free_prec = tn / (tn + fn) * 100 if tn + fn > 0 else 0
+    print(f"\n  Confusion matrix: TP={tp} FP={fp} TN={tn} FN={fn}")
+    print(f"  Occupied precision: {occ_prec:.1f}%")
+    print(f"  Free-space precision: {free_prec:.1f}%")
 
     print(f"\n{'='*50}")
     print(f"  Pass Criteria")
@@ -191,74 +164,68 @@ def run_mapping_mission():
     ok3 = free_prec > 80.0; passed &= ok3
     print(f"  3. Free-space precision > 80%: {free_prec:.1f}%  {'PASS' if ok3 else 'FAIL'}")
     print(f"  4. THROW/FLOOD share same mapper: PASS")
-    print(f"  5. Deterministic: baseline check")
 
     rtl_start_pos = trajectory[-1].copy()
     print(f"\n  MAPPING MISSION {'PASS' if passed else 'FAIL'}")
 
-    # ---- Return-to-Launch ----
+    # RTL
     print(f"\n{'='*50}")
     print(f"  Map-Driven Return-to-Launch")
     print(f"{'='*50}")
 
-    reset_body(pos=(rtl_start_pos[0], rtl_start_pos[1], 1.0))
+    reset_body_state(body, rs, pos=(rtl_start_pos[0], rtl_start_pos[1], 1.0))
     for _ in range(30):
         rs.clear_external_force()
         qc = body.get_quat().cpu().numpy(); p = body.get_pos().cpu().numpy()
         v = body.get_vel().cpu().numpy(); om = body.get_ang().cpu().numpy()
         Tt, qd = position_pd(np.array([rtl_start_pos[0], rtl_start_pos[1], 1.0]), p, v)
-        ta, _ = attitude_pd(qd, qc, om)
-        apply_rotor_forces(rs, li, np.clip(mixer(Tt, ta[0], ta[1], ta[2])[0], 0.0, None))
+        tau, _ = attitude_pd(qd, qc, om)
+        ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
+        apply_rotor_forces(rs, li, ts)
         scene.step()
 
     launch_pos = np.array([0.0, 0.0, 1.0])
     cur_pos = body.get_pos().cpu().numpy()
-
     inf = inflation_grid(mapper, inflate_r=4)
     sx, sy = mapper.w2g(cur_pos[0], cur_pos[1])
     gx, gy = mapper.w2g(launch_pos[0], launch_pos[1])
-    sx = max(0, min(mapper.w - 1, sx)); sy = max(0, min(mapper.h - 1, sy))
-    gx = max(0, min(mapper.w - 1, gx)); gy = max(0, min(mapper.h - 1, gy))
+    sx = max(0, min(mapper.w-1, sx)); sy = max(0, min(mapper.h-1, sy))
+    gx = max(0, min(mapper.w-1, gx)); gy = max(0, min(mapper.h-1, gy))
 
     pth = astar_path(inf, (sx, sy), (gx, gy))
     if pth is None:
         print(f"  A* FAILED: no path from ({sx},{sy}) to ({gx},{gy})")
     else:
-        waypoints_world = [np.array([mapper.g2w(ix, iy)[0], mapper.g2w(ix, iy)[1], 1.0]) for ix, iy in pth]
-        print(f"  A* path: {len(pth)} waypoints")
-
-        wp_i = 0
-        rtl_collision = False
-        rtl_traj = []
-        rtl_clr = float('inf')
-        az_cos = np.cos(np.radians(az_deg))
-
+        wp_i = 0; rtl_collision = False; rtl_traj = []; rtl_clr = float('inf')
         for step in range(8000):
             rs.clear_external_force()
             q_cur = body.get_quat().cpu().numpy(); pos = body.get_pos().cpu().numpy()
             vel = body.get_vel().cpu().numpy(); omega_w = body.get_ang().cpu().numpy()
 
-            if wp_i >= len(waypoints_world):
+            if wp_i >= len(pth):
                 tgt_wp = launch_pos.copy()
             else:
-                tgt_wp = waypoints_world[wp_i]
-            if np.linalg.norm(pos[:2] - tgt_wp[:2]) < 0.25:
-                if wp_i < len(waypoints_world):
-                    wp_i += 1
+                cx, cy = mapper.g2w(*pth[wp_i])
+                tgt_wp = np.array([cx, cy, 1.0])
+
+            dist = np.linalg.norm(pos[:2] - tgt_wp[:2])
+            speed = np.linalg.norm(vel[:2])
+            if dist < mapper.res * 1.5 and speed < 0.3:
+                wp_i += 1
 
             T_total, q_des = position_pd(tgt_wp, pos, vel)
             tau, _ = attitude_pd(q_des, q_cur, omega_w)
-            apply_rotor_forces(rs, li, np.clip(mixer(T_total, tau[0], tau[1], tau[2])[0], 0.0, None))
+            ts, sat, _ = mixer_with_authority(T_total, tau[0], tau[1], tau[2])
+            apply_rotor_forces(rs, li, ts)
             scene.step()
 
             pos = body.get_pos().cpu().numpy()
-            if pos[2] <= 0.01:
-                rtl_collision = True
+            if check_collision(body): rtl_collision = True
             rtl_traj.append(pos.copy())
 
             df_r = argus_flood.read()
-            raw_fr = df_r.distances.cpu().numpy().flatten()
-            valid_r = raw_fr[raw_fr >= 0]
+            valid_r = df_r.distances.cpu().numpy().flatten()
+            valid_r = valid_r[valid_r >= 0]
             if len(valid_r) > 0:
                 rtl_clr = min(rtl_clr, np.min(valid_r))
 
@@ -267,14 +234,11 @@ def run_mapping_mission():
 
         fpos = body.get_pos().cpu().numpy()
         rtl_d = np.linalg.norm(fpos[:2] - launch_pos[:2])
-        print(f"\n  Return leg:")
-        print(f"    Start: ({cur_pos[0]:.2f}, {cur_pos[1]:.2f})")
-        print(f"    Final: ({fpos[0]:.4f}, {fpos[1]:.4f})")
-        print(f"    Return dist: {rtl_d:.4f} m")
-        print(f"    Min clearance: {rtl_clr:.4f} m")
-        print(f"    Collision: {rtl_collision}")
-
-        print(f"\n  RETURN-TO-LAUNCH {'PASS' if (not rtl_collision and rtl_d < 0.05 and rtl_clr > 0.20) else 'FAIL'}")
+        print(f"\n  Return leg: start ({cur_pos[0]:.2f},{cur_pos[1]:.2f}) "
+              f"final ({fpos[0]:.4f},{fpos[1]:.4f})")
+        print(f"    dist={rtl_d:.4f} clear={rtl_clr:.4f} coll={rtl_collision}")
+        rtl_pass = not rtl_collision and rtl_d < 0.05 and rtl_clr > 0.20
+        print(f"  RETURN-TO-LAUNCH {'PASS' if rtl_pass else 'FAIL'}")
 
     return passed
 

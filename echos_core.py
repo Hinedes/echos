@@ -1,4 +1,5 @@
 """Shared geometry, dynamics, controller, mapper, and path utilities."""
+import math
 import numpy as np
 import heapq
 
@@ -17,6 +18,9 @@ KP_POS = 3.5
 KD_POS = 3.6
 MAX_TILT_DEG = 20.0
 MAX_HACC = G * np.tan(np.radians(MAX_TILT_DEG))
+MAX_THRUST = 2.0 * MASS * G        # per-rotor saturation (~4.4 N)
+BOOTSTRAP_DIST = 2.0                # metres forward for initial fly
+MAX_YAW_RATE = 3.0                  # rad/s maximum commanded yaw rate
 
 ROTOR_GEOM = [
     np.array([ARM, -ARM, 0.0]),
@@ -26,13 +30,14 @@ ROTOR_GEOM = [
 ]
 YAW_SIGNS = [1, -1, -1, 1]
 
-EMIT_OFFSET = (BODY_W / 2 + 0.004, 0.0, 0.0)
+# Emitter offsets
+PHYSICAL_EMITTER = BODY_W / 2                           # 0.0825 m
+RAYCAST_ORIGIN = BODY_W / 2 + 0.004                     # 0.0865 m
 
 # ---------------------------------------------------------------------------
-# Frame utilities — canonical naming
+# Frame utilities
 # ---------------------------------------------------------------------------
 def R_world_from_body(q):
-    """Active rotation: body-frame vector → world frame."""
     w, x, y, z = q
     return np.array([
         [1 - 2*(y*y + z*z), 2*(x*y - w*z),     2*(x*z + w*y)],
@@ -41,7 +46,6 @@ def R_world_from_body(q):
     ])
 
 def R_body_from_world(q):
-    """Rotation from world to body (= transpose of R_world_from_body)."""
     return R_world_from_body(q).T
 
 # ---------------------------------------------------------------------------
@@ -67,6 +71,20 @@ def quat_to_euler(q):
     pitch = np.arcsin(np.clip(2.0*(w*y - z*x), -1.0, 1.0))
     yaw = np.arctan2(2.0*(w*z + x*y), 1.0 - 2.0*(y*y + z*z))
     return np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
+
+def euler_to_quat(roll_deg, pitch_deg, yaw_deg):
+    cr = math.cos(math.radians(roll_deg/2))
+    sr = math.sin(math.radians(roll_deg/2))
+    cp = math.cos(math.radians(pitch_deg/2))
+    sp = math.sin(math.radians(pitch_deg/2))
+    cy = math.cos(math.radians(yaw_deg/2))
+    sy = math.sin(math.radians(yaw_deg/2))
+    return np.array([
+        cr*cp*cy + sr*sp*sy,
+        sr*cp*cy - cr*sp*sy,
+        cr*sp*cy + sr*cp*sy,
+        cr*cp*sy - sr*sp*cy,
+    ])
 
 def quat_from_R(R):
     t = np.trace(R)
@@ -101,6 +119,19 @@ def quat_attitude_error(qd, qc):
     return quat_mul(quat_conj(qd), qc)
 
 # ---------------------------------------------------------------------------
+# Yaw angle utilities
+# ---------------------------------------------------------------------------
+def angle_diff(target, current):
+    """Signed shortest angular difference in radians."""
+    return math.atan2(math.sin(target - current), math.cos(target - current))
+
+def move_toward_angle(current, target, max_step):
+    """Move current toward target by at most max_step (radians)."""
+    diff = angle_diff(target, current)
+    step = np.clip(diff, -max_step, max_step)
+    return current + step
+
+# ---------------------------------------------------------------------------
 # Controller
 # ---------------------------------------------------------------------------
 def position_pd(pos_des, pos_cur, vel_cur, psi_des=0.0):
@@ -124,7 +155,8 @@ def attitude_pd(q_des, q_cur, omega_world):
     return tau, qe
 
 def mixer(T, tx, ty, tz=0.0):
-    """Returns (thrusts, saturated, thrusts_raw)."""
+    """Returns (thrusts, saturated_mask, thrusts_raw).
+    Clips negative thrusts to zero. Upper limit is MAX_THRUST."""
     inv = 1.0 / (4.0 * ARM)
     ts_raw = np.array([
         T/4.0 - tx*inv - ty*inv + tz*inv,
@@ -132,9 +164,24 @@ def mixer(T, tx, ty, tz=0.0):
         T/4.0 - tx*inv + ty*inv - tz*inv,
         T/4.0 + tx*inv + ty*inv + tz*inv,
     ])
-    ts = np.clip(ts_raw, 0.0, None)
+    ts = np.clip(ts_raw, 0.0, MAX_THRUST)
     saturated = ts != ts_raw
     return ts, saturated, ts_raw
+
+def mixer_with_authority(T, tx, ty, tz=0.0):
+    """Mixer with yaw-torque limiting to preserve roll/pitch authority.
+    Returns (thrusts, saturated_mask, achieved_torque, thrusts_raw)."""
+    ts, sat, raw = mixer(T, tx, ty, tz)
+    if not np.any(sat):
+        return ts, sat, np.array([tx, ty, tz]), raw
+    # Yaw torque has lowest priority: recompute with tz reduced
+    tz_reduced = tz * 0.5
+    ts2, sat2, raw2 = mixer(T, tx, ty, tz_reduced)
+    if not np.any(sat2):
+        return ts2, sat2, np.array([tx, ty, tz_reduced]), raw2
+    # If still saturated, eliminate yaw torque entirely
+    ts3, sat3, raw3 = mixer(T, tx, ty, 0.0)
+    return ts3, sat3, np.array([tx, ty, 0.0]), raw3
 
 def apply_rotor_forces(rigid_solver, link_idx, thrusts):
     F_total = np.zeros(3)
@@ -154,6 +201,9 @@ def apply_rotor_forces(rigid_solver, link_idx, thrusts):
 # ---------------------------------------------------------------------------
 # Occupancy Grid Mapper
 # ---------------------------------------------------------------------------
+OCC_WEIGHT = 5      # weight of a hit observation
+FREE_WEIGHT = 1     # weight of a free observation
+
 class OccupancyMapper:
     def __init__(self, bounds, resolution=0.08):
         self.res = resolution
@@ -162,9 +212,11 @@ class OccupancyMapper:
         self.h = int((self.y_max - self.y_min) / self.res) + 1
         self.hits = np.zeros((self.h, self.w), dtype=np.int32)
         self.views = np.zeros((self.h, self.w), dtype=np.int32)
+        self.log_odds = np.zeros((self.h, self.w), dtype=np.float32)
 
     def w2g(self, x, y):
-        return int((x - self.x_min) / self.res), int((y - self.y_min) / self.res)
+        """World to grid, using math.floor for correct negative handling."""
+        return math.floor((x - self.x_min) / self.res), math.floor((y - self.y_min) / self.res)
 
     def g2w(self, ix, iy):
         return self.x_min + (ix + 0.5) * self.res, self.y_min + (iy + 0.5) * self.res
@@ -172,11 +224,15 @@ class OccupancyMapper:
     def in_b(self, ix, iy):
         return 0 <= ix < self.w and 0 <= iy < self.h
 
-    def update_ray(self, emitter_world, direction, raw_range, max_range, is_hit, eps=0.004):
-        """Single-ray update with NO lateral dilation — only directly traversed cells."""
-        ex, ey = emitter_world[0], emitter_world[1]
+    def update_ray(self, emitter, direction, raw_range, max_range, is_hit):
+        """Single-ray update with supercover traversal.
+        eps is NOT added — raw_range is the Genesis-measured distance.
+        All traversed cells except the terminal one are free observations.
+        The terminal cell (when is_hit) is an occupied observation.
+        """
+        ex, ey = emitter[0], emitter[1]
         if is_hit:
-            rng = raw_range + eps
+            rng = raw_range
         else:
             rng = max_range
         end_x = ex + direction[0] * rng
@@ -184,25 +240,42 @@ class OccupancyMapper:
 
         ix0, iy0 = self.w2g(ex, ey)
         ix1, iy1 = self.w2g(end_x, end_y)
-        n = max(abs(ix1 - ix0) + 1, abs(iy1 - iy0) + 1)
+
+        # Supercover line traversal (Bresenham-class)
+        dx = abs(ix1 - ix0)
+        dy = abs(iy1 - iy0)
+        n = max(dx, dy)
+        if n == 0:
+            return
+
+        step_x = 1 if ix1 >= ix0 else -1
+        step_y = 1 if iy1 >= iy0 else -1
+        cx, cy = ix0, iy0
 
         for i in range(n + 1):
             t = i / max(n, 1)
-            cx = int(round(ix0 + t * (ix1 - ix0)))
-            cy = int(round(iy0 + t * (iy1 - iy0)))
+            # integer position along the line
+            if n > 0:
+                cx = int(round(ix0 + t * (ix1 - ix0)))
+                cy = int(round(iy0 + t * (iy1 - iy0)))
             if not self.in_b(cx, cy):
                 continue
-            self.views[cy, cx] += 1
-            if i >= n - 1 and is_hit:
-                self.hits[cy, cx] += 1
+            if i == n:
+                if is_hit:
+                    self.log_odds[cy, cx] += OCC_WEIGHT
+                    self.hits[cy, cx] += 1
+                self.views[cy, cx] += 1
+            else:
+                self.log_odds[cy, cx] -= FREE_WEIGHT
+                self.views[cy, cx] += 1
 
     def get_map(self):
         occ = np.zeros((self.h, self.w))
-        mask = self.views > 0
-        ratio = np.zeros_like(self.views, dtype=float)
-        ratio[mask] = self.hits[mask].astype(float) / self.views[mask]
-        occ[(mask) & (self.hits >= 1) & (self.hits > self.views * 0.04)] = 1.0
-        occ[(mask) & (ratio < 0.02)] = 0.5
+        # Occupied: log_odds > 0 (hits dominate) AND at least one hit
+        occ[(self.log_odds > 0) & (self.hits >= 1)] = 1.0
+        # Free: log_odds < 0 (views dominate) AND no hits
+        occ[(self.log_odds < 0) & (self.hits == 0)] = 0.5
+        # If log_odds == 0 or mixed evidence, keep as unknown (0.0)
         return occ
 
     def get_views(self):
@@ -212,11 +285,11 @@ class OccupancyMapper:
         return self.hits
 
 # ---------------------------------------------------------------------------
-# A* path planner
+# A* path planner (octile heuristic)
 # ---------------------------------------------------------------------------
+SQRT2 = math.sqrt(2.0)
+
 def astar_path(inflation_grid, start, goal):
-    """A* on an inflation grid where 0 = traversable, nonzero = blocked.
-    Returns list of (ix, iy) cells or None."""
     h, w = inflation_grid.shape
     sx, sy = start
     gx, gy = goal
@@ -227,7 +300,12 @@ def astar_path(inflation_grid, start, goal):
     if not free(sx, sy) or not free(gx, gy):
         return None
 
-    opens = [(0, (sx, sy))]
+    def heuristic(ix, iy):
+        dx = abs(ix - gx)
+        dy = abs(iy - gy)
+        return max(dx, dy) + (SQRT2 - 1.0) * min(dx, dy)
+
+    opens = [(heuristic(sx, sy), (sx, sy))]
     came = {}
     g_c = {(sx, sy): 0}
 
@@ -251,47 +329,21 @@ def astar_path(inflation_grid, start, goal):
             if dx != 0 and dy != 0:
                 if not free(cx + dx, cy) or not free(cx, cy + dy):
                     continue
-            ng = g_c[cur] + (1.414 if dx != 0 and dy != 0 else 1.0)
+            cost = SQRT2 if (dx != 0 and dy != 0) else 1.0
+            ng = g_c[cur] + cost
             if (nx, ny) not in g_c or ng < g_c[(nx, ny)]:
                 came[(nx, ny)] = cur
                 g_c[(nx, ny)] = ng
-                heapq.heappush(opens, (ng + abs(nx - gx) + abs(ny - gy), (nx, ny)))
+                heapq.heappush(opens, (ng + heuristic(nx, ny), (nx, ny)))
     return None
 
 # ---------------------------------------------------------------------------
-# Obstacle inflation builder
+# Obstacle inflation
 # ---------------------------------------------------------------------------
-def inflation_grid(mapper, inflate_r=4, traj_cells=None, traj_clear_r=2):
+def inflation_grid(mapper, inflate_r=4):
     """Build inflation grid from mapper occupancy.
-    - Known-free (0.5) cells start traversable (0).
-    - Occupied (1.0) cells dilated by inflate_r → blocked (1.0) in free space only.
-    - Unknown (0.0) cells blocked (1.0).
-    - Trajectory cells cleared to traversable (0) — use with extreme care.
-    """
-    occ = mapper.get_map()
-    h, w = occ.shape
-    inf = np.ones((h, w))
-    for iy in range(h):
-        for ix in range(w):
-            if occ[iy, ix] == 0.5:
-                inf[iy, ix] = 0.0
-    for iy in range(h):
-        for ix in range(w):
-            if occ[iy, ix] == 1.0:
-                for dy in range(-inflate_r, inflate_r + 1):
-                    for dx in range(-inflate_r, inflate_r + 1):
-                        nx, ny = ix + dx, iy + dy
-                        if 0 <= nx < w and 0 <= ny < h and occ[ny, nx] == 0.5:
-                            inf[ny, nx] = 1.0
-    inf[occ == 0.0] = 1.0
-    if traj_cells:
-        for (ix, iy) in traj_cells:
-            if 0 <= ix < w and 0 <= iy < h:
-                inf[iy, ix] = 0.0
-    return inf
-
-def inflation_from_mapper(mapper, inflate_r=4):
-    """Convenience: build inflation grid from a mapper's get_map()."""
+    Known-free cells start traversable. Occupied cells dilated into free only.
+    Unknown cells blocked. Trajectory history is NOT force-cleared."""
     occ = mapper.get_map()
     h, w = occ.shape
     inf = np.ones((h, w))
@@ -311,11 +363,29 @@ def inflation_from_mapper(mapper, inflate_r=4):
     return inf
 
 # ---------------------------------------------------------------------------
-# Collision helpers
+# Collision detection
 # ---------------------------------------------------------------------------
 def check_collision(body, body_h=BODY_H):
     """Check ground collision using body altitude and half-height.
-    Returns True if the body is at or below ground level."""
+    Returns True if the body is at or below ground level.
+    (Genesis contact query not yet available — altitude sentinel only.)"""
     pos = body.get_pos().cpu().numpy()
-    z_threshold = body_h / 2 + 0.005
-    return pos[2] <= z_threshold
+    z_thresh = body_h / 2 + 0.005
+    return pos[2] <= z_thresh
+
+# ---------------------------------------------------------------------------
+# Reset helpers
+# ---------------------------------------------------------------------------
+def reset_body_state(body, rigid_solver, pos=(0.0, 0.0, 1.0), quat=None):
+    """Reset body position, orientation, and external forces.
+    Genesis does not expose set_vel/set_ang — momentum carries over."""
+    body.set_pos(pos)
+    body.set_quat(quat if quat is not None else np.array([1.0, 0.0, 0.0, 0.0]))
+    rigid_solver.clear_external_force()
+
+# ---------------------------------------------------------------------------
+# Bootstrap target
+# ---------------------------------------------------------------------------
+def bootstrap_target(launch, dist=BOOTSTRAP_DIST):
+    """Fixed bootstrap target: dist metres forward from launch."""
+    return np.array([launch[0] + dist, launch[1], launch[2]])

@@ -2,6 +2,7 @@
 import genesis as gs
 import numpy as np
 from echos_core import *
+import math
 
 gs.init(backend=gs.amdgpu)
 scene = gs.Scene(show_viewer=False, rigid_options=gs.options.RigidOptions(enable_collision=True))
@@ -17,22 +18,17 @@ scene.add_entity(gs.morphs.Plane())
 
 argus_flood = scene.add_sensor(gs.sensors.Raycaster(
     pattern=gs.sensors.SphericalPattern(fov=(60.0, 0.0), n_points=(7, 1)),
-    entity_idx=body.idx, pos_offset=EMIT_OFFSET, euler_offset=(0.0, 0.0, 0.0),
-    max_range=5.0, no_hit_value=-1.0))
+    entity_idx=body.idx, pos_offset=(RAYCAST_ORIGIN, 0.0, 0.0),
+    euler_offset=(0.0, 0.0, 0.0), max_range=5.0, no_hit_value=-1.0))
 argus_throw = scene.add_sensor(gs.sensors.Raycaster(
     pattern=gs.sensors.SphericalPattern(angles=(np.array([0.0]), np.array([0.0]))),
-    entity_idx=body.idx, pos_offset=EMIT_OFFSET, euler_offset=(0.0, 0.0, 0.0),
-    max_range=8.0, no_hit_value=-1.0))
+    entity_idx=body.idx, pos_offset=(RAYCAST_ORIGIN, 0.0, 0.0),
+    euler_offset=(0.0, 0.0, 0.0), max_range=8.0, no_hit_value=-1.0))
 
 scene.build()
 body.set_mass(MASS)
 rs = scene.sim.rigid_solver
 li = 0
-
-def reset_body(pos=(0.0, 0.0, 1.0), quat=None):
-    body.set_pos(pos)
-    body.set_quat(quat if quat is not None else np.array([1.0, 0.0, 0.0, 0.0]))
-    rs.clear_external_force()
 
 
 def frontier_clusters(occ, inf):
@@ -48,8 +44,7 @@ def frontier_clusters(occ, inf):
     lab = np.zeros((h, w), dtype=np.int32); cl = 1; eq = {}
     for iy in range(1, h-1):
         for ix in range(1, w-1):
-            if fg[iy, ix] == 0:
-                continue
+            if fg[iy, ix] == 0: continue
             up = lab[iy-1, ix]; le = lab[iy, ix-1]
             ul = lab[iy-1, ix-1]; ur = lab[iy-1, ix+1]
             ns = [l for l in [up, le, ul, ur] if l > 0]
@@ -76,9 +71,9 @@ def frontier_clusters(occ, inf):
     return cs
 
 
-def select_frontier(occ, inf, cs, pos, mapper, gx, gy):
-    sx, sy = mapper.w2g(pos[0], pos[1])
-    best = None; bs = -1; bk = None; cur_path = None
+def select_frontier(occ, inf, cs, cur_pos, mapper):
+    sx, sy = mapper.w2g(cur_pos[0], cur_pos[1])
+    best = None; bs = -1; cur_path = None
 
     for l, cells in cs.items():
         if len(cells) < 5: continue
@@ -103,14 +98,21 @@ def select_frontier(occ, inf, cs, pos, mapper, gx, gy):
         pth = astar_path(inf, (sx, sy), (gx, gy))
         if pth is None: continue
 
-        cx_w, cy_w = mapper.g2w(gx, gy)
-        gn = len(cells); ct = len(pth) * mapper.res
-        sc = gn / (ct + 0.01)
-        cl_info = {"cx": cx_w, "cy": cy_w, "cix": gx, "ciy": gy, "n": gn,
+        gn = len(cells)
+        ct = sum(1 for i in range(len(pth)-1) for _ in [0])  # count steps
+        # Actual path cost
+        path_cost = 0.0
+        for i in range(1, len(pth)):
+            dx = abs(pth[i][0] - pth[i-1][0])
+            dy = abs(pth[i][1] - pth[i-1][1])
+            path_cost += SQRT2 if (dx != 0 and dy != 0) else 1.0
+        cost_m = path_cost * mapper.res
+        sc = gn / (cost_m + 0.01)
+        cl_info = {"cx": mapper.g2w(gx, gy)[0], "cy": mapper.g2w(gx, gy)[1],
+                   "cix": gx, "ciy": gy, "n": gn,
                    "ucx": uc_x, "ucy": uc_y, "adj_unk_n": len(adj_unk)}
-        ky = (sc, gx, gy)
-        if best is None or sc > bs or (abs(sc-bs) < 1e-6 and ky < bk):
-            best = cl_info; bs = sc; bk = ky; cur_path = pth
+        if best is None or sc > bs:
+            best = cl_info; bs = sc; cur_path = pth
 
     if best is not None:
         uc_wx = mapper.x_min + (best["ucx"] + 0.5) * mapper.res
@@ -126,19 +128,22 @@ def run_frontier_exploration():
     print("  Autonomous Frontier Exploration")
     print("="*50)
 
-    reset_body(pos=(0.0, 0.0, 1.0))
+    reset_body_state(body, rs, pos=(0.0, 0.0, 1.0))
     for _ in range(20):
         rs.clear_external_force()
         qc = body.get_quat().cpu().numpy(); p = body.get_pos().cpu().numpy()
         v = body.get_vel().cpu().numpy(); om = body.get_ang().cpu().numpy()
         Tt, qd = position_pd(np.array([0.0, 0.0, 1.0]), p, v)
-        apply_rotor_forces(rs, li, np.clip(mixer(Tt, *attitude_pd(qd, qc, om)[0])[0], 0.0, None))
+        tau, _ = attitude_pd(qd, qc, om)
+        ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
+        apply_rotor_forces(rs, li, ts)
         scene.step()
 
     mx, mxx, my, myy = -2.0, 7.0, -2.0, 5.0
     mapper = OccupancyMapper((mx, mxx, my, myy), 0.08)
-    eps = 0.004; az_deg = np.linspace(-30, 30, 7)
+    az_deg = np.linspace(-30, 30, 7)
     launch = np.array([0.0, 0.0, 1.0])
+    bootstrap_tgt = bootstrap_target(launch)
     max_steps = 15000; replan_iv = 120
 
     state = "INITIAL_FLY"
@@ -147,13 +152,10 @@ def run_frontier_exploration():
     min_clr = float('inf'); collided = False
     best = None
 
-    # HOLD_AND_OBSERVE persistent state
+    # Persistent yaw command (slew-limited across all states)
+    yaw_cmd = 0.0
     hold_pos = None
-    hold_yaw = 0.0
-    align_steps = 0
-    scan_steps = 0
-    yaw_aligned = False
-    scanning = False
+    align_steps = 0; scan_steps = 0; yaw_aligned = False
 
     for step in range(max_steps):
         rs.clear_external_force()
@@ -169,21 +171,23 @@ def run_frontier_exploration():
             dt = argus_throw.read(); raw_t = dt.distances.flatten()[0].item()
 
         Rwb = R_world_from_body(q_cur)
-        ew = pos + Rwb @ np.array([EMIT_OFFSET[0], 0.0, 0.0])
+        ew = pos + Rwb @ np.array([RAYCAST_ORIGIN, 0.0, 0.0])
 
         for i in range(7):
             az = np.radians(az_deg[i]); db = np.array([np.cos(az), np.sin(az), 0.0])
             dw = Rwb @ db; hit = raw_f[i] >= 0; rr = raw_f[i] if hit else 0.0
-            mapper.update_ray(ew, dw, rr, 5.0, hit, eps)
+            mapper.update_ray(ew, dw, rr, 5.0, hit)
         if is_thr:
             dwt = Rwb @ np.array([1.0, 0.0, 0.0]); htt = raw_t >= 0
-            mapper.update_ray(ew, dwt, raw_t if htt else 0.0, 8.0, htt, eps)
+            mapper.update_ray(ew, dwt, raw_t if htt else 0.0, 8.0, htt)
 
-        # State machine
+        # --- state machine ---
         if step < 300:
-            tgt = np.array([pos[0]+2.0, 0.0, 1.0])
-            Tt, qd = position_pd(tgt, pos, vel)
-            apply_rotor_forces(rs, li, np.clip(mixer(Tt, *attitude_pd(qd, q_cur, om)[0])[0], 0.0, None))
+            tgt = bootstrap_tgt.copy()
+            Tt, qd = position_pd(tgt, pos, vel, yaw_cmd)
+            tau, _ = attitude_pd(qd, q_cur, om)
+            ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
+            apply_rotor_forces(rs, li, ts)
             scene.step()
             pos = body.get_pos().cpu().numpy()
             if check_collision(body): collided = True
@@ -193,92 +197,104 @@ def run_frontier_exploration():
         if state == "INITIAL_FLY":
             state = "EXPLORE"
 
-        # ---- EXPLORE / replan ----
+        # --- replan ---
         if state == "EXPLORE" and step % replan_iv == 0:
             occ = mapper.get_map()
             inf = inflation_grid(mapper, inflate_r=4)
-
-            sx, sy = mapper.w2g(pos[0], pos[1])
             cs = frontier_clusters(occ, inf)
-            best, cur_path = select_frontier(occ, inf, cs, pos, mapper, sx, sy)
+            best, cur_path = select_frontier(occ, inf, cs, pos, mapper)
 
             if best is None:
                 dec.append((step, "NO_FRONTIER", pos[0], pos[1]))
                 print(f"  step {step}: no reachable frontier -> RTL")
-                # Break immediately — start RTL from current airborne state
                 break
             else:
-                state = "FLY_TO_FRONTIER"
-                wp_i = 0
+                state = "FLY_TO_FRONTIER"; wp_i = 0
                 front_log.append({"step": step, "cx": best["cx"], "cy": best["cy"],
                                   "n": best["n"], "score": best["score"],
                                   "observe_heading": best["observe_heading"]})
                 if len(front_log) <= 10:
-                    print(f"  step {step}: frontier #{len(front_log)} ({best['cx']:.2f},{best['cy']:.2f}) "
+                    print(f"  step {step}: frontier #{len(front_log)} "
+                          f"({best['cx']:.2f},{best['cy']:.2f}) "
                           f"n={best['n']} score={best['score']:.3f}")
 
-        # ---- FLY_TO_FRONTIER ----
+        # --- FLY_TO_FRONTIER ---
         if state == "FLY_TO_FRONTIER":
             if wp_i >= len(cur_path):
                 state = "HOLD_AND_OBSERVE"
                 hold_pos = pos.copy()
-                hold_yaw = best["observe_heading"]
-                align_steps = 0; scan_steps = 0
-                yaw_aligned = False; scanning = False
+                align_steps = 0; scan_steps = 0; yaw_aligned = False
                 if best is not None:
-                    print(f"  step {step}: reached frontier, yaw target={np.degrees(hold_yaw):.1f}")
+                    print(f"  step {step}: reached frontier, "
+                          f"yaw target={np.degrees(best['observe_heading']):.1f}")
             else:
                 cx, cy = mapper.g2w(*cur_path[wp_i])
                 tgt = np.array([cx, cy, 1.0])
-                if np.linalg.norm(pos[:2] - tgt[:2]) < 0.25:
+                dist = np.linalg.norm(pos[:2] - tgt[:2])
+                speed = np.linalg.norm(vel[:2])
+                if dist < mapper.res * 1.5 and speed < 0.3:
                     wp_i += 1
-                Tt, qd = position_pd(tgt, pos, vel)
-                apply_rotor_forces(rs, li, np.clip(mixer(Tt, *attitude_pd(qd, q_cur, om)[0])[0], 0.0, None))
+                Tt, qd = position_pd(tgt, pos, vel, yaw_cmd)
+                tau, _ = attitude_pd(qd, q_cur, om)
+                ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
+                apply_rotor_forces(rs, li, ts)
 
-        # ---- HOLD_AND_OBSERVE ----
+        # --- HOLD_AND_OBSERVE ---
         elif state == "HOLD_AND_OBSERVE":
+            yaw_target = best["observe_heading"]
+            yaw_cmd = move_toward_angle(yaw_cmd, yaw_target, MAX_YAW_RATE * 0.01)
+
             if not yaw_aligned and align_steps < 200:
-                psi_des = -hold_yaw
-                # Use captured hold position
-                Tt, qd = position_pd(hold_pos, pos, vel, psi_des)
-                apply_rotor_forces(rs, li, np.clip(mixer(Tt, *attitude_pd(qd, q_cur, om)[0])[0], 0.0, None))
+                Tt, qd = position_pd(hold_pos, pos, vel, yaw_cmd)
+                tau, _ = attitude_pd(qd, q_cur, om)
+                ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
+                apply_rotor_forces(rs, li, ts)
                 align_steps += 1
 
                 body_x = Rwb @ np.array([1.0, 0.0, 0.0])
                 uk_x, uk_y = best["uk_world"]
                 unk_dir = np.array([uk_x - best["cx"], uk_y - best["cy"], 0.0])
-                unk_dir /= np.linalg.norm(unk_dir)
+                unk_dir /= max(np.linalg.norm(unk_dir), 1e-10)
                 dot_val = body_x @ unk_dir
 
                 if align_steps == 1:
-                    print(f"    yaw aligning... heading={np.degrees(psi_des):.1f} dot={dot_val:.4f}")
+                    print(f"    yaw aligning to {np.degrees(yaw_target):.1f} "
+                          f"dot={dot_val:.4f}")
                 if dot_val > 0.99:
                     yaw_aligned = True
-                    print(f"    aligned: dot={dot_val:.4f}  scan begins")
+                    print(f"    aligned: dot={dot_val:.4f}")
             elif yaw_aligned and scan_steps < 30:
-                # Scan using captured hold position AND captured hold yaw
-                Tt, qd = position_pd(hold_pos, pos, vel, -hold_yaw)
-                apply_rotor_forces(rs, li, np.clip(mixer(Tt, *attitude_pd(qd, q_cur, om)[0])[0], 0.0, None))
+                Tt, qd = position_pd(hold_pos, pos, vel, yaw_cmd)
+                tau, _ = attitude_pd(qd, q_cur, om)
+                ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
+                apply_rotor_forces(rs, li, ts)
                 scan_steps += 1
             elif yaw_aligned and scan_steps >= 30:
                 state = "EXPLORE"
                 print(f"    scan complete ({scan_steps} steps)")
+            elif align_steps >= 200:
+                # Alignment timeout — abort this frontier
+                print(f"    ALIGN TIMEOUT at step {step} — abort frontier")
+                state = "EXPLORE"
             else:
-                # Fallthrough: hold position with observation yaw
-                Tt, qd = position_pd(hold_pos, pos, vel, -hold_yaw)
-                apply_rotor_forces(rs, li, np.clip(mixer(Tt, *attitude_pd(qd, q_cur, om)[0])[0], 0.0, None))
+                Tt, qd = position_pd(hold_pos, pos, vel, yaw_cmd)
+                tau, _ = attitude_pd(qd, q_cur, om)
+                ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
+                apply_rotor_forces(rs, li, ts)
 
-        # ---- EXPLORE (idle between replans) ----
+        # --- EXPLORE idle ---
         elif state == "EXPLORE":
-            Tt, qd = position_pd(np.array([pos[0], pos[1], 1.0]), pos, vel)
-            apply_rotor_forces(rs, li, np.clip(mixer(Tt, *attitude_pd(qd, q_cur, om)[0])[0], 0.0, None))
+            Tt, qd = position_pd(np.array([pos[0], pos[1], 1.0]), pos, vel, yaw_cmd)
+            tau, _ = attitude_pd(qd, q_cur, om)
+            ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
+            apply_rotor_forces(rs, li, ts)
 
         scene.step()
         pos = body.get_pos().cpu().numpy()
         if check_collision(body): collided = True
         traj.append(pos.copy()); scan_log.append((step, raw_f.copy(), state))
 
-    # ---- RTL ----
+    # --- RTL ---
     occ = mapper.get_map()
     inf = inflation_grid(mapper, inflate_r=4)
     sx, sy = mapper.w2g(pos[0], pos[1])
@@ -303,14 +319,18 @@ def run_frontier_exploration():
                 c2x, c2y = mapper.g2w(*pth[wp_i_rtl])
                 tgt2 = np.array([c2x, c2y, 1.0])
 
-            if np.linalg.norm(p2[:2] - tgt2[:2]) < 0.25:
+            dist = np.linalg.norm(p2[:2] - tgt2[:2])
+            speed = np.linalg.norm(v2[:2])
+            if dist < mapper.res * 1.5 and speed < 0.3:
                 wp_i_rtl += 1
 
             if np.linalg.norm(p2[:2] - launch[:2]) < 0.04 and s2 > 50:
                 break
 
-            Tt, qd = position_pd(tgt2, p2, v2)
-            apply_rotor_forces(rs, li, np.clip(mixer(Tt, *attitude_pd(qd, qc, om2)[0])[0], 0.0, None))
+            Tt, qd = position_pd(tgt2, p2, v2, yaw_cmd)
+            tau, _ = attitude_pd(qd, qc, om2)
+            ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
+            apply_rotor_forces(rs, li, ts)
             scene.step()
 
     fpos = body.get_pos().cpu().numpy()
@@ -346,16 +366,22 @@ def run_frontier_exploration():
     print("  Pass Criteria")
     print("="*50)
     ok = True
-    r1 = er > 50.0; ok &= r1
-    print(f"  1. Explored > 50%: {er:.1f}%  {'PASS' if r1 else 'FAIL'}")
+    er_pass = er >= 95.0; ok &= er_pass
+    print(f"  1. Explored >= 95%: {er:.1f}%  {'PASS' if er_pass else 'FAIL'}")
     r2 = not collided; ok &= r2
     print(f"  2. No collision: {'PASS' if r2 else 'FAIL'}")
     r3 = min_clr > 0.20; ok &= r3
-    print(f"  3. Clearance > 0.20: {min_clr:.4f}  {'PASS' if r3 else 'FAIL'}")
+    print(f"  3. Clearance > 0.20 m: {min_clr:.4f}  {'PASS' if r3 else 'FAIL'}")
     r4 = len(front_log) > 0; ok &= r4
-    print(f"  4. Frontiers: {len(front_log)}  {'PASS' if r4 else 'FAIL'}")
+    print(f"  4. Frontiers found: {len(front_log)}  {'PASS' if r4 else 'FAIL'}")
     r5 = rtl_d < 0.05; ok &= r5
-    print(f"  5. RTL < 5 cm: {rtl_d:.4f}  {'PASS' if r5 else 'FAIL'}")
+    print(f"  5. RTL within 5 cm: {rtl_d:.4f}  {'PASS' if r5 else 'FAIL'}")
+    dec_reasons = [d[1] for d in dec]
+    r6 = "NO_FRONTIER" in dec_reasons; ok &= r6
+    print(f"  6. Terminated by NO_FRONTIER: {r6}  {'PASS' if r6 else 'FAIL'}")
+    r7 = er_pass and r2 and r3 and r4 and r5 and r6
+    ok &= r7
+    print(f"  7. All primary gates pass: {'PASS' if r7 else 'FAIL'}")
     print(f"\n  FRONTIER EXPLORATION {'PASS' if ok else 'FAIL'}")
     return ok
 

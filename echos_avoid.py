@@ -17,7 +17,7 @@ scene.add_entity(gs.morphs.Box(size=(0.5, 0.8, 1.5), pos=(3.5, 0.0, 0.75), fixed
 scene.add_entity(gs.morphs.Box(size=(0.15, 0.15, 0.5), pos=(5.5, 0.0, 0.75), fixed=True))
 scene.add_entity(gs.morphs.Box(size=(0.15, 0.15, 0.5), pos=(0.94, 0.342, 1.0), fixed=True))
 
-emit_off = EMIT_OFFSET
+emit_off = (RAYCAST_ORIGIN, 0.0, 0.0)
 
 argus_flood = scene.add_sensor(
     gs.sensors.Raycaster(
@@ -99,6 +99,7 @@ def run_avoidance_mission():
     lateral_reached = False
     goal_reached = False
     collision = False
+    hold_target = None
     ground = False
     flood_clear_count = 0
     hold_steps = 0
@@ -190,13 +191,14 @@ def run_avoidance_mission():
                 hold_steps = 0
                 final_standoff = throw_range
                 target = pos.copy()
+                hold_target = pos.copy()
                 decisions.append((step, "HOLD_START", pos[0], throw_range))
             else:
                 target = np.array([pos[0] + 1.0, 0.0, 1.0])
 
         elif state == "HOLD":
             hold_steps += 1
-            target = pos.copy()
+            target = hold_target.copy()
             if hold_steps >= 100:
                 decisions.append((step, "MISSION_END", pos[0], throw_range))
                 break
@@ -214,6 +216,8 @@ def run_avoidance_mission():
         pos = body.get_pos().cpu().numpy()
         if pos[2] <= 0.01:
             ground = True
+        if check_collision(body):
+            collision = True
         trajectory.append(pos.copy())
         scan_log.append((step, ranges.copy(), state))
 
@@ -367,7 +371,7 @@ def run_avoidance_mission():
     t2_fld = read_flood()
     fwd_misses = t2_thr > 0 and t2_thr > 3.0  # THROW sees back wall or main obstacle, not the 1m target
     flood_hits = t2_fld[5] > 0 and t2_fld[5] < 2.0  # FLOOD +20° (index 5) sees obstacle at ~1m
-    t2_ok = flood_hits
+    t2_ok = flood_hits and not fwd_misses
     mode_ok &= t2_ok
     print(f"    THROW forward: range={t2_thr:.4f} (sees wall at ~5.9m, misses off-axis)")
     print(f"    FLOOD +20°: range={t2_fld[5]:.4f} (expect ~1.0m, hits off-axis target)")
@@ -408,6 +412,7 @@ def run_avoidance_mission():
     print(f"  Per-mode beams & returns printed above")
 
     print(f"\n  ARGUS MODE TESTS {'PASS' if mode_ok else 'FAIL'}")
-    return passed
+    return passed and mode_ok
 
-run_avoidance_mission()
+if __name__ == "__main__":
+    raise SystemExit(0 if run_avoidance_mission() else 1)

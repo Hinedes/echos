@@ -1214,24 +1214,21 @@ def run_3d_stationary_scan():
     return passed
 
 
-run_pos_test("X offset 0.5 m → origin", init_pos=(0.5, 0.0, 1.0), pos_des=(0.0, 0.0, 1.0))
-run_pos_test("Y offset 0.5 m → origin", init_pos=(0.0, 0.5, 1.0), pos_des=(0.0, 0.0, 1.0))
-run_pos_test("Z offset 0.5 m → z=1", init_pos=(0.0, 0.0, 1.5), pos_des=(0.0, 0.0, 1.0))
-
-print("\nALL POSITION CONTROL TESTS COMPLETE")
-
-route = [
-    (0.0, 0.0, 1.0),
-    (1.0, 0.0, 1.0),
-    (1.0, 1.0, 1.0),
-    (0.0, 1.0, 1.0),
-    (0.0, 0.0, 1.0),
-]
-run_waypoint_mission(route)
-run_hover_gust_test()
-run_route_gust_test(route)
-run_yaw_error_test()
-run_argus_tests()
-run_scan_tests()
-run_motion_scan()
-run_3d_stationary_scan()
+if __name__ == "__main__":
+    import sys
+    results = []
+    results.append(run_pos_test("X offset 0.5m", init_pos=(0.5, 0.0, 1.0), pos_des=(0.0, 0.0, 1.0)))
+    results.append(run_pos_test("Y offset 0.5m", init_pos=(0.0, 0.5, 1.0), pos_des=(0.0, 0.0, 1.0)))
+    results.append(run_pos_test("Z offset 0.5m", init_pos=(0.0, 0.0, 1.5), pos_des=(0.0, 0.0, 1.0)))
+    route = [np.array([0.0, 0.0, 1.0]), np.array([1.0, 0.0, 1.0]),
+             np.array([1.0, 1.0, 1.0]), np.array([0.0, 1.0, 1.0]),
+             np.array([0.0, 0.0, 1.0])]
+    results.append(run_waypoint_mission(route))
+    results.append(run_hover_gust_test())
+    results.append(run_route_gust_test(route))
+    results.append(run_yaw_error_test())
+    results.append(run_argus_tests())
+    results.append(run_scan_tests())
+    results.append(run_motion_scan())
+    results.append(run_3d_stationary_scan())
+    raise SystemExit(0 if all(results) else 1)

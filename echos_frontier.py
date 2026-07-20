@@ -135,7 +135,7 @@ def run_frontier_exploration():
         v = body.get_vel().cpu().numpy(); om = body.get_ang().cpu().numpy()
         Tt, qd = position_pd(np.array([0.0, 0.0, 1.0]), p, v)
         tau, _ = attitude_pd(qd, qc, om)
-        ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
+        ts, sat, _, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
         apply_rotor_forces(rs, li, ts)
         scene.step()
 
@@ -181,35 +181,27 @@ def run_frontier_exploration():
             dwt = Rwb @ np.array([1.0, 0.0, 0.0]); htt = raw_t >= 0
             mapper.update_ray(ew, dwt, raw_t if htt else 0.0, 8.0, htt)
 
-        # --- state machine ---
+        # --- state machine (all paths compute thrust; no gravity-only steps) ---
+        active_state = "INITIAL_FLY" if step < 300 else state
+        state_changed = False
+
         if step < 300:
-            tgt = bootstrap_tgt.copy()
-            Tt, qd = position_pd(tgt, pos, vel, yaw_cmd)
-            tau, _ = attitude_pd(qd, q_cur, om)
-            ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
-            apply_rotor_forces(rs, li, ts)
-            scene.step()
-            pos = body.get_pos().cpu().numpy()
-            if check_collision(body): collided = True
-            traj.append(pos.copy()); scan_log.append((step, raw_f.copy(), "INITIAL_FLY"))
-            continue
+            pass
+        elif state == "INITIAL_FLY":
+            state = "EXPLORE"; state_changed = True
 
-        if state == "INITIAL_FLY":
-            state = "EXPLORE"
-
-        # --- replan ---
-        if state == "EXPLORE" and step % replan_iv == 0:
+        # Replan
+        if step >= 300 and state == "EXPLORE" and step % replan_iv == 0:
             occ = mapper.get_map()
             inf = inflation_grid(mapper, inflate_r=4)
             cs = frontier_clusters(occ, inf)
             best, cur_path = select_frontier(occ, inf, cs, pos, mapper)
-
             if best is None:
                 dec.append((step, "NO_FRONTIER", pos[0], pos[1]))
                 print(f"  step {step}: no reachable frontier -> RTL")
                 break
             else:
-                state = "FLY_TO_FRONTIER"; wp_i = 0
+                state = "FLY_TO_FRONTIER"; wp_i = 0; state_changed = True
                 front_log.append({"step": step, "cx": best["cx"], "cy": best["cy"],
                                   "n": best["n"], "score": best["score"],
                                   "observe_heading": best["observe_heading"]})
@@ -218,81 +210,63 @@ def run_frontier_exploration():
                           f"({best['cx']:.2f},{best['cy']:.2f}) "
                           f"n={best['n']} score={best['score']:.3f}")
 
-        # --- FLY_TO_FRONTIER ---
-        if state == "FLY_TO_FRONTIER":
-            if wp_i >= len(cur_path):
-                state = "HOLD_AND_OBSERVE"
-                hold_pos = pos.copy()
-                align_steps = 0; scan_steps = 0; yaw_aligned = False
-                if best is not None:
-                    print(f"  step {step}: reached frontier, "
-                          f"yaw target={np.degrees(best['observe_heading']):.1f}")
-            else:
-                cx, cy = mapper.g2w(*cur_path[wp_i])
-                tgt = np.array([cx, cy, 1.0])
-                dist = np.linalg.norm(pos[:2] - tgt[:2])
-                speed = np.linalg.norm(vel[:2])
-                if dist < mapper.res * 1.5 and speed < 0.3:
-                    wp_i += 1
-                Tt, qd = position_pd(tgt, pos, vel, yaw_cmd)
-                tau, _ = attitude_pd(qd, q_cur, om)
-                ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
-                apply_rotor_forces(rs, li, ts)
-
-        # --- HOLD_AND_OBSERVE ---
-        elif state == "HOLD_AND_OBSERVE":
+        # HOLD_AND_OBSERBE state transitions
+        if state == "HOLD_AND_OBSERVE":
             yaw_target = best["observe_heading"]
             yaw_cmd = move_toward_angle(yaw_cmd, yaw_target, MAX_YAW_RATE * 0.01)
-
             if not yaw_aligned and align_steps < 200:
-                Tt, qd = position_pd(hold_pos, pos, vel, yaw_cmd)
-                tau, _ = attitude_pd(qd, q_cur, om)
-                ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
-                apply_rotor_forces(rs, li, ts)
                 align_steps += 1
-
                 body_x = Rwb @ np.array([1.0, 0.0, 0.0])
                 uk_x, uk_y = best["uk_world"]
                 unk_dir = np.array([uk_x - best["cx"], uk_y - best["cy"], 0.0])
                 unk_dir /= max(np.linalg.norm(unk_dir), 1e-10)
                 dot_val = body_x @ unk_dir
-
-                if align_steps == 1:
-                    print(f"    yaw aligning to {np.degrees(yaw_target):.1f} "
-                          f"dot={dot_val:.4f}")
                 if dot_val > 0.99:
                     yaw_aligned = True
                     print(f"    aligned: dot={dot_val:.4f}")
             elif yaw_aligned and scan_steps < 30:
-                Tt, qd = position_pd(hold_pos, pos, vel, yaw_cmd)
-                tau, _ = attitude_pd(qd, q_cur, om)
-                ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
-                apply_rotor_forces(rs, li, ts)
                 scan_steps += 1
             elif yaw_aligned and scan_steps >= 30:
-                state = "EXPLORE"
+                state = "EXPLORE"; state_changed = True
                 print(f"    scan complete ({scan_steps} steps)")
             elif align_steps >= 200:
-                # Alignment timeout — abort this frontier
+                state = "EXPLORE"; state_changed = True
+                # Exclude this frontier from reselection
+                if best is not None:
+                    best["failed"] = True
                 print(f"    ALIGN TIMEOUT at step {step} — abort frontier")
-                state = "EXPLORE"
-            else:
-                Tt, qd = position_pd(hold_pos, pos, vel, yaw_cmd)
-                tau, _ = attitude_pd(qd, q_cur, om)
-                ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
-                apply_rotor_forces(rs, li, ts)
 
-        # --- EXPLORE idle ---
-        elif state == "EXPLORE":
-            Tt, qd = position_pd(np.array([pos[0], pos[1], 1.0]), pos, vel, yaw_cmd)
-            tau, _ = attitude_pd(qd, q_cur, om)
-            ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
-            apply_rotor_forces(rs, li, ts)
+        # --- thrust computation (every iteration) ---
+        if step < 300:
+            tgt = bootstrap_tgt.copy()
+        elif state == "FLY_TO_FRONTIER" and wp_i < len(cur_path):
+            cx, cy = mapper.g2w(*cur_path[wp_i])
+            tgt = np.array([cx, cy, 1.0])
+            dist = np.linalg.norm(pos[:2] - tgt[:2])
+            speed = np.linalg.norm(vel[:2])
+            if dist < mapper.res * 1.5 and speed < 0.3:
+                wp_i += 1
+        elif state == "HOLD_AND_OBSERVE":
+            tgt = hold_pos.copy()
+        elif state == "FLY_TO_FRONTIER":
+            # All waypoints exhausted — transitioning to HOLD next iteration
+            tgt = np.array([pos[0], pos[1], 1.0])
+            state = "HOLD_AND_OBSERVE"; state_changed = True
+            hold_pos = pos.copy(); align_steps = 0; scan_steps = 0; yaw_aligned = False
+            if best is not None:
+                print(f"  step {step}: reached frontier, "
+                      f"yaw target={np.degrees(best['observe_heading']):.1f}")
+        else:
+            tgt = np.array([pos[0], pos[1], 1.0])
 
+        Tt, qd = position_pd(tgt, pos, vel, yaw_cmd)
+        tau, _ = attitude_pd(qd, q_cur, om)
+        ts, sat, _, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
+        apply_rotor_forces(rs, li, ts)
         scene.step()
         pos = body.get_pos().cpu().numpy()
         if check_collision(body): collided = True
-        traj.append(pos.copy()); scan_log.append((step, raw_f.copy(), state))
+        traj.append(pos.copy()); scan_log.append((step, raw_f.copy(), active_state))
 
     # --- RTL ---
     occ = mapper.get_map()
@@ -329,7 +303,7 @@ def run_frontier_exploration():
 
             Tt, qd = position_pd(tgt2, p2, v2, yaw_cmd)
             tau, _ = attitude_pd(qd, qc, om2)
-            ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
+            ts, sat, _, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
             apply_rotor_forces(rs, li, ts)
             scene.step()
 
@@ -385,4 +359,5 @@ def run_frontier_exploration():
     print(f"\n  FRONTIER EXPLORATION {'PASS' if ok else 'FAIL'}")
     return ok
 
-run_frontier_exploration()
+if __name__ == "__main__":
+    raise SystemExit(0 if run_frontier_exploration() else 1)

@@ -42,7 +42,7 @@ def run_mapping_mission():
         v = body.get_vel().cpu().numpy(); om = body.get_ang().cpu().numpy()
         Tt, qd = position_pd(np.array([0.0, 0.0, 1.0]), p, v)
         tau, _ = attitude_pd(qd, qc, om)
-        ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
+        ts, sat, _, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
         apply_rotor_forces(rs, li, ts)
         scene.step()
 
@@ -88,7 +88,7 @@ def run_mapping_mission():
 
         T_total, q_des = position_pd(target, pos, vel)
         tau, _ = attitude_pd(q_des, q_cur, omega_w)
-        ts, sat, _ = mixer_with_authority(T_total, tau[0], tau[1], tau[2])
+        ts, sat, _, _ = mixer_with_authority(T_total, tau[0], tau[1], tau[2])
         apply_rotor_forces(rs, li, ts)
         scene.step()
 
@@ -180,7 +180,7 @@ def run_mapping_mission():
         v = body.get_vel().cpu().numpy(); om = body.get_ang().cpu().numpy()
         Tt, qd = position_pd(np.array([rtl_start_pos[0], rtl_start_pos[1], 1.0]), p, v)
         tau, _ = attitude_pd(qd, qc, om)
-        ts, sat, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
+        ts, sat, _, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
         apply_rotor_forces(rs, li, ts)
         scene.step()
 
@@ -215,7 +215,7 @@ def run_mapping_mission():
 
             T_total, q_des = position_pd(tgt_wp, pos, vel)
             tau, _ = attitude_pd(q_des, q_cur, omega_w)
-            ts, sat, _ = mixer_with_authority(T_total, tau[0], tau[1], tau[2])
+            ts, sat, _, _ = mixer_with_authority(T_total, tau[0], tau[1], tau[2])
             apply_rotor_forces(rs, li, ts)
             scene.step()
 
@@ -242,4 +242,5 @@ def run_mapping_mission():
 
     return passed
 
-run_mapping_mission()
+if __name__ == "__main__":
+    raise SystemExit(0 if run_mapping_mission() else 1)

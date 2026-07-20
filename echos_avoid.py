@@ -1,29 +1,14 @@
 import genesis as gs
 import numpy as np
+from echos_core import *
 
 gs.init(backend=gs.amdgpu)
 
 scene = gs.Scene(show_viewer=False, rigid_options=gs.options.RigidOptions(enable_collision=True))
 
-body_w, body_d, body_h = 0.165, 0.165, 0.0545
-mass = 0.225
-g = 9.81
-arm = 0.0511
-Kp_att = 0.06
-Kd_att = 0.018
-Kp_pos = 3.5
-Kd_pos = 3.6
-MAX_TILT_DEG = 20.0
-MAX_HORIZ_ACCEL = g * np.tan(np.radians(MAX_TILT_DEG))
+# physical constants imported from echos_core
 
-rotors = [
-    np.array([arm, -arm, 0.0]),
-    np.array([arm,  arm, 0.0]),
-    np.array([-arm, -arm, 0.0]),
-    np.array([-arm,  arm, 0.0]),
-]
-
-body = scene.add_entity(gs.morphs.Box(size=(body_w, body_d, body_h), pos=(0, 0, 1), fixed=False))
+body = scene.add_entity(gs.morphs.Box(size=(BODY_W, BODY_D, BODY_H), pos=(0, 0, 1), fixed=False))
 scene.add_entity(gs.morphs.Box(size=(14.0, 0.01, 2.0), pos=(5.0, -2.0, 1.0), fixed=True))
 scene.add_entity(gs.morphs.Box(size=(14.0, 0.01, 2.0), pos=(5.0, 2.0, 1.0), fixed=True))
 scene.add_entity(gs.morphs.Box(size=(0.01, 4.0, 2.0), pos=(10.0, 0.0, 1.0), fixed=True))
@@ -32,7 +17,7 @@ scene.add_entity(gs.morphs.Box(size=(0.5, 0.8, 1.5), pos=(3.5, 0.0, 0.75), fixed
 scene.add_entity(gs.morphs.Box(size=(0.15, 0.15, 0.5), pos=(5.5, 0.0, 0.75), fixed=True))
 scene.add_entity(gs.morphs.Box(size=(0.15, 0.15, 0.5), pos=(0.94, 0.342, 1.0), fixed=True))
 
-emit_off = (body_w / 2 + 0.004, 0.0, 0.0)
+emit_off = EMIT_OFFSET
 
 argus_flood = scene.add_sensor(
     gs.sensors.Raycaster(
@@ -50,108 +35,31 @@ argus_throw = scene.add_sensor(
 )
 
 scene.build()
-body.set_mass(mass)
+body.set_mass(MASS)
 rigid_solver = scene.sim.rigid_solver
 link_idx = 0
 
-def quat_conj(q):
-    w, x, y, z = q
-    return np.array([w, -x, -y, -z])
+# imported from echos_core
 
-def quat_mul(q1, q2):
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
-    return np.array([
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2,
-    ])
+# imported from echos_core
 
-def quat_to_euler(q):
-    w, x, y, z = q
-    roll = np.arctan2(2.0*(w*x + y*z), 1.0 - 2.0*(x*x + y*y))
-    pitch = np.arcsin(np.clip(2.0*(w*y - z*x), -1.0, 1.0))
-    yaw = np.arctan2(2.0*(w*z + x*y), 1.0 - 2.0*(y*y + z*z))
-    return np.degrees([roll, pitch, yaw])
+# imported from echos_core
 
-def rot_world_to_body(q):
-    w, x, y, z = q
-    return np.array([
-        [1 - 2*(y*y + z*z), 2*(x*y - w*z),     2*(x*z + w*y)],
-        [2*(x*y + w*z),     1 - 2*(x*x + z*z), 2*(y*z - w*x)],
-        [2*(x*z - w*y),     2*(y*z + w*x),     1 - 2*(x*x + y*y)],
-    ])
+# imported from echos_core  (renamed R_world_from_body)
 
-def rot_to_quat(R):
-    t = np.trace(R)
-    if t > 0:
-        s = 0.5 / np.sqrt(t + 1.0)
-        return np.array([0.25 / s, (R[2,1] - R[1,2]) * s, (R[0,2] - R[2,0]) * s, (R[1,0] - R[0,1]) * s])
-    if R[0,0] > R[1,1] and R[0,0] > R[2,2]:
-        s = 2.0 * np.sqrt(max(0.0, 1.0 + R[0,0] - R[1,1] - R[2,2]))
-        return np.array([(R[2,1] - R[1,2]) / s, 0.25 * s, (R[0,1] + R[1,0]) / s, (R[0,2] + R[2,0]) / s])
-    if R[1,1] > R[2,2]:
-        s = 2.0 * np.sqrt(max(0.0, 1.0 + R[1,1] - R[0,0] - R[2,2]))
-        return np.array([(R[0,2] - R[2,0]) / s, (R[0,1] + R[1,0]) / s, 0.25 * s, (R[1,2] + R[2,1]) / s])
-    s = 2.0 * np.sqrt(max(0.0, 1.0 + R[2,2] - R[0,0] - R[1,1]))
-    return np.array([(R[1,0] - R[0,1]) / s, (R[0,2] + R[2,0]) / s, (R[1,2] + R[2,1]) / s, 0.25 * s])
+# imported from echos_core  (renamed quat_from_R)
 
-def quat_from_z_yaw(z_des, psi_des):
-    x_c = np.array([np.cos(psi_des), np.sin(psi_des), 0.0])
-    zn = z_des / np.linalg.norm(z_des)
-    y_des = np.cross(zn, x_c)
-    yn = np.linalg.norm(y_des)
-    if yn < 1e-10:
-        y_des = np.array([0.0, 1.0, 0.0])
-    else:
-        y_des = y_des / yn
-    x_des = np.cross(y_des, zn)
-    return rot_to_quat(np.column_stack([x_des, y_des, zn]))
+# imported from echos_core
 
-def position_pd(pos_des, pos_cur, vel_cur, psi_des=0.0):
-    pos_err = pos_des - pos_cur
-    a_des = Kp_pos * pos_err - Kd_pos * vel_cur
-    a_des[0] = np.clip(a_des[0], -MAX_HORIZ_ACCEL, MAX_HORIZ_ACCEL)
-    a_des[1] = np.clip(a_des[1], -MAX_HORIZ_ACCEL, MAX_HORIZ_ACCEL)
-    T_vec = mass * (a_des + np.array([0.0, 0.0, g]))
-    T_total = np.linalg.norm(T_vec)
-    if T_total < 1e-6:
-        return mass * g, np.array([1.0, 0.0, 0.0, 0.0])
-    return T_total, quat_from_z_yaw(T_vec / T_total, psi_des)
+# imported from echos_core
 
-def attitude_pd(q_des, q_cur, omega_world):
-    q_err = quat_mul(quat_conj(q_des), q_cur)
-    sign = 1.0 if q_err[0] >= 0.0 else -1.0
-    e_R = 2.0 * sign * q_err[1:4]
-    omega_body = rot_world_to_body(q_cur) @ omega_world
-    return -Kp_att * e_R - Kd_att * omega_body
+# imported from echos_core
 
-def mixer(T, tx, ty, tz=0.0):
-    inv = 1.0 / (4.0 * arm)
-    return np.array([
-        T/4.0 - tx*inv - ty*inv + tz*inv,
-        T/4.0 + tx*inv - ty*inv - tz*inv,
-        T/4.0 - tx*inv + ty*inv - tz*inv,
-        T/4.0 + tx*inv + ty*inv + tz*inv,
-    ])
+# imported from echos_core
 
-def apply_rotor_forces(thrusts):
-    F_total = np.zeros(3)
-    tau_total = np.zeros(3)
-    yaw_signs = [1, -1, -1, 1]
-    for i, (r, f) in enumerate(zip(rotors, thrusts)):
-        F = np.array([0.0, 0.0, f])
-        tau_total += np.cross(r, F)
-        tau_total[2] += arm * yaw_signs[i] * f
-        F_total += F
-    rigid_solver.apply_links_external_force(
-        force=F_total.reshape(1, 3), links_idx=[link_idx], ref="link_origin", local=True,
-    )
-    rigid_solver.apply_links_external_torque(
-        torque=tau_total.reshape(1, 3), links_idx=[link_idx], ref="link_origin", local=True,
-    )
+# imported from echos_core
 
+# imported from echos_core
 def reset_body(pos=(0.0, 0.0, 1.0), quat=None):
     body.set_pos(pos)
     body.set_quat(quat if quat is not None else np.array([1.0, 0.0, 0.0, 0.0]))
@@ -175,8 +83,8 @@ def run_avoidance_mission():
         v = body.get_vel().cpu().numpy()
         om = body.get_ang().cpu().numpy()
         Tt, qd = position_pd(np.array([0.0, 0.0, 1.0]), p, v)
-        ta = attitude_pd(qd, qc, om)
-        apply_rotor_forces(np.clip(mixer(Tt, ta[0], ta[1], ta[2]), 0.0, None))
+        ta, _ = attitude_pd(qd, qc, om)
+        apply_rotor_forces(rigid_solver, link_idx, np.clip(mixer(Tt, ta[0], ta[1], ta[2])[0], 0.0, None))
         scene.step()
 
     goal = np.array([6.0, 0.0, 1.0])
@@ -297,9 +205,9 @@ def run_avoidance_mission():
             avoid_min_clearance = min(avoid_min_clearance, np.min(valid))
 
         T_total, q_des = position_pd(target, pos, vel)
-        tau = attitude_pd(q_des, q_cur, omega_w)
-        thrusts = mixer(T_total, tau[0], tau[1], tau[2])
-        apply_rotor_forces(np.clip(thrusts, 0.0, None))
+        tau, _ = attitude_pd(q_des, q_cur, omega_w)
+        thrusts, _, _ = mixer(T_total, tau[0], tau[1], tau[2])
+        apply_rotor_forces(rigid_solver, link_idx, np.clip(thrusts, 0.0, None))
         scene.step()
 
         q_cur = body.get_quat().cpu().numpy()
@@ -317,7 +225,7 @@ def run_avoidance_mission():
     final_pos = body.get_pos().cpu().numpy()
     final_dist = np.linalg.norm(final_pos - goal)
     reached = final_dist < 0.25
-    physical_x = body_w / 2
+    physical_x = BODY_W / 2
 
     print(f"\n  Trajectory summary:")
     print(f"    Start:  ({trajectory[0][0]:.4f}, {trajectory[0][1]:.4f}, {trajectory[0][2]:.4f})")
@@ -388,8 +296,8 @@ def run_avoidance_mission():
             v = body.get_vel().cpu().numpy()
             om = body.get_ang().cpu().numpy()
             Tt, qd = position_pd(np.array([0.0, 0.0, 1.0]), p, v)
-            ta = attitude_pd(qd, qc, om)
-            apply_rotor_forces(np.clip(mixer(Tt, ta[0], ta[1], ta[2]), 0.0, None))
+            ta, _ = attitude_pd(qd, qc, om)
+            apply_rotor_forces(rigid_solver, link_idx, np.clip(mixer(Tt, ta[0], ta[1], ta[2])[0], 0.0, None))
             scene.step()
         d2 = argus_flood.read()
         r2 = d2.distances.cpu().numpy().flatten()
@@ -405,7 +313,7 @@ def run_avoidance_mission():
     print(f"  ARGUS Mode Tests")
     print(f"{'='*50}")
     eps = 0.004
-    physical_x = body_w / 2
+    physical_x = BODY_W / 2
     mode_ok = True
 
     def settle(px, py):
@@ -417,8 +325,8 @@ def run_avoidance_mission():
             v = body.get_vel().cpu().numpy()
             om = body.get_ang().cpu().numpy()
             Tt, qd = position_pd(np.array([px, py, 1.0]), p, v)
-            ta = attitude_pd(qd, qc, om)
-            apply_rotor_forces(np.clip(mixer(Tt, ta[0], ta[1], ta[2]), 0.0, None))
+            ta, _ = attitude_pd(qd, qc, om)
+            apply_rotor_forces(rigid_solver, link_idx, np.clip(mixer(Tt, ta[0], ta[1], ta[2])[0], 0.0, None))
             scene.step()
 
     def read_throw():

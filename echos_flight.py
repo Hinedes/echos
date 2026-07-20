@@ -1,5 +1,6 @@
 import genesis as gs
 import numpy as np
+from echos_core import *
 
 gs.init(backend=gs.amdgpu)
 
@@ -10,28 +11,10 @@ scene = gs.Scene(
     ),
 )
 
-body_w = 0.165
-body_d = 0.165
-body_h = 0.0545
-mass = 0.225
-g = 9.81
-arm = 0.0511
-Kp_att = 0.06
-Kd_att = 0.018
-Kp_pos = 3.5
-Kd_pos = 3.6
-MAX_TILT_DEG = 20.0
-MAX_HORIZ_ACCEL = g * np.tan(np.radians(MAX_TILT_DEG))
-
-rotors = [
-    np.array([ arm, -arm, 0.0]),
-    np.array([ arm,  arm, 0.0]),
-    np.array([-arm, -arm, 0.0]),
-    np.array([-arm,  arm, 0.0]),
-]
+# physical constants imported from echos_core
 
 body = scene.add_entity(
-    gs.morphs.Box(size=(body_w, body_d, body_h), pos=(0.0, 0.0, 1.0), fixed=False),
+    gs.morphs.Box(size=(BODY_W, BODY_D, BODY_H), pos=(0.0, 0.0, 1.0), fixed=False),
 )
 wall_surface_x = 3.0125  # front-wall surface
 wall_surface_y = 3.0125  # side-wall surface (analytic; raycaster cannot detect thin Y-boxes)
@@ -43,7 +26,7 @@ floor = scene.add_entity(
     gs.morphs.Plane(),
 )
 
-emitter_offset = (body_w / 2, 0.0, 0.0)
+emitter_offset = (BODY_W / 2, 0.0, 0.0)
 pattern_fwd = gs.sensors.SphericalPattern(
     angles=(np.array([0.0]), np.array([0.0])),
 )
@@ -85,38 +68,17 @@ argus_scan = scene.add_sensor(
 )
 
 scene.build()
-body.set_mass(mass)
+body.set_mass(MASS)
 rigid_solver = scene.sim.rigid_solver
 link_idx = 0
 
-def quat_conj(q):
-    w, x, y, z = q
-    return np.array([w, -x, -y, -z])
+# imported from echos_core
 
-def quat_mul(q1, q2):
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
-    return np.array([
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2,
-    ])
+# imported from echos_core
 
-def quat_to_euler(q):
-    w, x, y, z = q
-    roll = np.arctan2(2.0*(w*x + y*z), 1.0 - 2.0*(x*x + y*y))
-    pitch = np.arcsin(np.clip(2.0*(w*y - z*x), -1.0, 1.0))
-    yaw = np.arctan2(2.0*(w*z + x*y), 1.0 - 2.0*(y*y + z*z))
-    return np.degrees([roll, pitch, yaw])
+# imported from echos_core
 
-def rot_world_to_body(q):
-    w, x, y, z = q
-    return np.array([
-        [1 - 2*(y*y + z*z), 2*(x*y - w*z),     2*(x*z + w*y)],
-        [2*(x*y + w*z),     1 - 2*(x*x + z*z), 2*(y*z - w*x)],
-        [2*(x*z - w*y),     2*(y*z + w*x),     1 - 2*(x*x + y*y)],
-    ])
+# imported from echos_core  (renamed R_world_from_body)
 
 def angle_error(q_des, q_cur):
     q_err = quat_mul(quat_conj(q_des), q_cur)
@@ -128,92 +90,19 @@ def cos_tilt(q):
 def tilt_deg(q):
     return np.degrees(np.arccos(np.clip(cos_tilt(q), -1.0, 1.0)))
 
-def rot_to_quat(R):
-    t = np.trace(R)
-    if t > 0:
-        s = 0.5 / np.sqrt(t + 1.0)
-        qw = 0.25 / s
-        qx = (R[2,1] - R[1,2]) * s
-        qy = (R[0,2] - R[2,0]) * s
-        qz = (R[1,0] - R[0,1]) * s
-    else:
-        if R[0,0] > R[1,1] and R[0,0] > R[2,2]:
-            s = 2.0 * np.sqrt(max(0.0, 1.0 + R[0,0] - R[1,1] - R[2,2]))
-            qw = (R[2,1] - R[1,2]) / s
-            qx = 0.25 * s
-            qy = (R[0,1] + R[1,0]) / s
-            qz = (R[0,2] + R[2,0]) / s
-        elif R[1,1] > R[2,2]:
-            s = 2.0 * np.sqrt(max(0.0, 1.0 + R[1,1] - R[0,0] - R[2,2]))
-            qw = (R[0,2] - R[2,0]) / s
-            qx = (R[0,1] + R[1,0]) / s
-            qy = 0.25 * s
-            qz = (R[1,2] + R[2,1]) / s
-        else:
-            s = 2.0 * np.sqrt(max(0.0, 1.0 + R[2,2] - R[0,0] - R[1,1]))
-            qw = (R[1,0] - R[0,1]) / s
-            qx = (R[0,2] + R[2,0]) / s
-            qy = (R[1,2] + R[2,1]) / s
-            qz = 0.25 * s
-    return np.array([qw, qx, qy, qz])
+# imported from echos_core  (renamed quat_from_R)
 
-def quat_from_z_yaw(z_des, psi_des):
-    x_c = np.array([np.cos(psi_des), np.sin(psi_des), 0.0])
-    zn = z_des / np.linalg.norm(z_des)
-    y_des = np.cross(zn, x_c)
-    yn = np.linalg.norm(y_des)
-    if yn < 1e-10:
-        y_des = np.array([0.0, 1.0, 0.0])
-    else:
-        y_des = y_des / yn
-    x_des = np.cross(y_des, zn)
-    R_des = np.column_stack([x_des, y_des, zn])
-    return rot_to_quat(R_des)
+# imported from echos_core
 
-def position_pd(pos_des, pos_cur, vel_cur, psi_des=0.0):
-    pos_err = pos_des - pos_cur
-    a_des = Kp_pos * pos_err - Kd_pos * vel_cur
-    a_des[0] = np.clip(a_des[0], -MAX_HORIZ_ACCEL, MAX_HORIZ_ACCEL)
-    a_des[1] = np.clip(a_des[1], -MAX_HORIZ_ACCEL, MAX_HORIZ_ACCEL)
-    g_vec = np.array([0.0, 0.0, g])
-    T_vec = mass * (a_des + g_vec)
-    T_total = np.linalg.norm(T_vec)
-    if T_total < 1e-6:
-        return mass * g, np.array([1.0, 0.0, 0.0, 0.0])
-    z_des = T_vec / T_total
-    return T_total, quat_from_z_yaw(z_des, psi_des)
+# imported from echos_core
 
-def attitude_pd(q_des, q_cur, omega_world):
-    q_err = quat_mul(quat_conj(q_des), q_cur)
-    sign = 1.0 if q_err[0] >= 0.0 else -1.0
-    e_R = 2.0 * sign * q_err[1:4]
-    omega_body = rot_world_to_body(q_cur) @ omega_world
-    return -Kp_att * e_R - Kd_att * omega_body
+# imported from echos_core
 
-def mixer(T, tau_x, tau_y, tau_z=0.0):
-    inv = 1.0 / (4.0 * arm)
-    f0 = T / 4.0 - tau_x * inv - tau_y * inv + tau_z * inv
-    f1 = T / 4.0 + tau_x * inv - tau_y * inv - tau_z * inv
-    f2 = T / 4.0 - tau_x * inv + tau_y * inv - tau_z * inv
-    f3 = T / 4.0 + tau_x * inv + tau_y * inv + tau_z * inv
-    return np.array([f0, f1, f2, f3])
+# imported from echos_core
 
-def apply_rotor_forces(thrusts):
-    F_total = np.zeros(3)
-    tau_total = np.zeros(3)
-    yaw_signs = [1, -1, -1, 1]
-    for i, (r, f) in enumerate(zip(rotors, thrusts)):
-        F = np.array([0.0, 0.0, f])
-        tau_total += np.cross(r, F)
-        tau_total[2] += arm * yaw_signs[i] * f
-        F_total += F
-    rigid_solver.apply_links_external_force(
-        force=F_total.reshape(1, 3), links_idx=[link_idx], ref="link_origin", local=True,
-    )
-    rigid_solver.apply_links_external_torque(
-        torque=tau_total.reshape(1, 3), links_idx=[link_idx], ref="link_origin", local=True,
-    )
+# imported from echos_core
 
+# imported from echos_core
 def reset_body(pos=(0.0, 0.0, 1.0), quat=None):
     body.set_pos(pos)
     q = quat if quat is not None else np.array([1.0, 0.0, 0.0, 0.0])
@@ -241,15 +130,15 @@ def run_pos_test(name, init_pos, pos_des, steps=600):
         omega_w = body.get_ang().cpu().numpy()
 
         T_total, q_des = position_pd(pos_des, pos, vel)
-        tau = attitude_pd(q_des, q_cur, omega_w)
+        tau, _ = attitude_pd(q_des, q_cur, omega_w)
 
-        thrusts = mixer(T_total, tau[0], tau[1], tau[2])
+        thrusts, _, _ = mixer(T_total, tau[0], tau[1], tau[2])
         thrusts = np.clip(thrusts, 0.0, None)
 
         if np.any(thrusts <= 1e-9):
             has_negative = True
 
-        apply_rotor_forces(thrusts)
+        apply_rotor_forces(rigid_solver, link_idx, thrusts)
         scene.step()
 
         q_cur = body.get_quat().cpu().numpy()
@@ -323,15 +212,15 @@ def run_waypoint_mission(waypoints, max_steps_per_leg=2000):
             omega_w = body.get_ang().cpu().numpy()
 
             T_total, q_des = position_pd(np.array(wp), pos, vel)
-            tau = attitude_pd(q_des, q_cur, omega_w)
+            tau, _ = attitude_pd(q_des, q_cur, omega_w)
 
-            thrusts = mixer(T_total, tau[0], tau[1], tau[2])
+            thrusts, _, _ = mixer(T_total, tau[0], tau[1], tau[2])
             thrusts = np.clip(thrusts, 0.0, None)
 
             if np.any(thrusts <= 1e-9):
                 has_negative = True
 
-            apply_rotor_forces(thrusts)
+            apply_rotor_forces(rigid_solver, link_idx, thrusts)
             scene.step()
 
             q_cur = body.get_quat().cpu().numpy()
@@ -432,15 +321,15 @@ def run_hover_gust_test():
         omega_w = body.get_ang().cpu().numpy()
 
         T_total, q_des = position_pd(target, pos, vel)
-        tau = attitude_pd(q_des, q_cur, omega_w)
+        tau, _ = attitude_pd(q_des, q_cur, omega_w)
 
-        thrusts = mixer(T_total, tau[0], tau[1], tau[2])
+        thrusts, _, _ = mixer(T_total, tau[0], tau[1], tau[2])
         thrusts = np.clip(thrusts, 0.0, None)
 
         if np.any(thrusts <= 1e-9):
             has_negative = True
 
-        apply_rotor_forces(thrusts)
+        apply_rotor_forces(rigid_solver, link_idx, thrusts)
 
         if gust_start <= i < gust_end:
             rigid_solver.apply_links_external_force(
@@ -538,15 +427,15 @@ def run_route_gust_test(waypoints, max_steps_per_leg=2000):
             omega_w = body.get_ang().cpu().numpy()
 
             T_total, q_des = position_pd(np.array(wp), pos, vel)
-            tau = attitude_pd(q_des, q_cur, omega_w)
+            tau, _ = attitude_pd(q_des, q_cur, omega_w)
 
-            thrusts = mixer(T_total, tau[0], tau[1], tau[2])
+            thrusts, _, _ = mixer(T_total, tau[0], tau[1], tau[2])
             thrusts = np.clip(thrusts, 0.0, None)
 
             if np.any(thrusts <= 1e-9):
                 has_negative = True
 
-            apply_rotor_forces(thrusts)
+            apply_rotor_forces(rigid_solver, link_idx, thrusts)
 
             if wp_idx == gust_id and gust_start <= i < gust_end:
                 gust_force = np.array([0.0, -0.30, 0.0])
@@ -672,15 +561,15 @@ def run_yaw_error_test():
         omega_w = body.get_ang().cpu().numpy()
 
         T_total, q_des = position_pd(target, pos, vel)
-        tau = attitude_pd(q_des, q_cur, omega_w)
+        tau, _ = attitude_pd(q_des, q_cur, omega_w)
 
-        thrusts = mixer(T_total, tau[0], tau[1], tau[2])
+        thrusts, _, _ = mixer(T_total, tau[0], tau[1], tau[2])
         thrusts = np.clip(thrusts, 0.0, None)
 
         if np.any(thrusts <= 1e-9):
             has_negative = True
 
-        apply_rotor_forces(thrusts)
+        apply_rotor_forces(rigid_solver, link_idx, thrusts)
         scene.step()
 
         q_cur = body.get_quat().cpu().numpy()
@@ -734,10 +623,10 @@ def read_argus(sensor, settle_steps=5):
         vel = body.get_vel().cpu().numpy()
         omega_w = body.get_ang().cpu().numpy()
         T_total, q_des = position_pd(np.array([0.0, 0.0, 1.0]), pos, vel)
-        tau = attitude_pd(q_des, q_cur, omega_w)
-        thrusts = mixer(T_total, tau[0], tau[1], tau[2])
+        tau, _ = attitude_pd(q_des, q_cur, omega_w)
+        thrusts, _, _ = mixer(T_total, tau[0], tau[1], tau[2])
         thrusts = np.clip(thrusts, 0.0, None)
-        apply_rotor_forces(thrusts)
+        apply_rotor_forces(rigid_solver, link_idx, thrusts)
         scene.step()
     return sensor.read().distances.flatten()[0].item()
 
@@ -748,7 +637,7 @@ def run_argus_tests():
     print(f"{'='*50}")
 
     passed = True
-    emitter_arm = body_w / 2
+    emitter_arm = BODY_W / 2
 
     # Test 1: wall 3.0 m from emitter
     reset_body(pos=(0.0, 0.0, 1.0))
@@ -810,10 +699,10 @@ def run_argus_scan(print_output=True):
         vel = body.get_vel().cpu().numpy()
         omega_w = body.get_ang().cpu().numpy()
         T_total, q_des = position_pd(np.array([0.0, 0.0, 1.0]), pos, vel)
-        tau = attitude_pd(q_des, q_cur, omega_w)
-        thrusts = mixer(T_total, tau[0], tau[1], tau[2])
+        tau, _ = attitude_pd(q_des, q_cur, omega_w)
+        thrusts, _, _ = mixer(T_total, tau[0], tau[1], tau[2])
         thrusts = np.clip(thrusts, 0.0, None)
-        apply_rotor_forces(thrusts)
+        apply_rotor_forces(rigid_solver, link_idx, thrusts)
         scene.step()
 
     data = argus_scan.read()
@@ -862,7 +751,7 @@ def run_scan_tests():
     print(f"  ARGUS Scan Tests")
     print(f"{'='*50}")
     passed = True
-    emitter_arm = body_w / 2
+    emitter_arm = BODY_W / 2
 
     scan1 = run_argus_scan(print_output=True)
 
@@ -961,7 +850,7 @@ def run_motion_scan():
     reset_body(pos=(0.0, 0.0, 1.0))
     target = np.array([1.0, 0.0, 1.0])
     total_steps = 600
-    emitter_arm = body_w / 2
+    emitter_arm = BODY_W / 2
     raw_rays = []
     pos_0, q_0 = None, None
 
@@ -974,10 +863,10 @@ def run_motion_scan():
         vel = body.get_vel().cpu().numpy()
         omega_w = body.get_ang().cpu().numpy()
         T_total, q_des = position_pd(target, pos, vel)
-        tau = attitude_pd(q_des, q_cur, omega_w)
-        thrusts = mixer(T_total, tau[0], tau[1], tau[2])
+        tau, _ = attitude_pd(q_des, q_cur, omega_w)
+        thrusts, _, _ = mixer(T_total, tau[0], tau[1], tau[2])
         thrusts = np.clip(thrusts, 0.0, None)
-        apply_rotor_forces(thrusts)
+        apply_rotor_forces(rigid_solver, link_idx, thrusts)
         scene.step()
 
         q_cur = body.get_quat().cpu().numpy()
@@ -1001,7 +890,7 @@ def run_motion_scan():
                 'pos': pos.copy(), 'q': q_cur.copy(),
             })
 
-    R_bw_0 = rot_world_to_body(q_0).T
+    R_bw_0 = R_body_from_world(q_0)
     wall_comp, wall_uncomp = [], []
     floor_comp, floor_uncomp = [], []
     wall_steps, wall_pitches = [], []
@@ -1012,7 +901,7 @@ def run_motion_scan():
             n_miss += 1
             continue
         n_valid += 1
-        R_bw = rot_world_to_body(ray['q']).T
+        R_bw = R_body_from_world(ray['q'])
         pt_w = ray['pos'] + R_bw @ ray['pt_body']
         pt_u = pos_0 + R_bw_0 @ ray['pt_body']
         ray['pt_world'] = pt_w
@@ -1103,7 +992,7 @@ def run_3d_stationary_scan():
 
     yaw_angles_deg = np.arange(-60, 61, 10)
     n_yaw = len(yaw_angles_deg)
-    emitter_arm = body_w / 2
+    emitter_arm = BODY_W / 2
     settle_steps = 20
     ply_path = "/workspace/argus_3d_scan.ply"
 
@@ -1120,9 +1009,9 @@ def run_3d_stationary_scan():
                 v = body.get_vel().cpu().numpy()
                 om = body.get_ang().cpu().numpy()
                 Tt, qd = position_pd(np.array([0.0, 0.0, 1.0]), p, v, psi_des)
-                ta = attitude_pd(qd, qc, om)
-                th = mixer(Tt, ta[0], ta[1], ta[2])
-                apply_rotor_forces(np.clip(th, 0.0, None))
+                ta, _ = attitude_pd(qd, qc, om)
+                th, _, _ = mixer(Tt, ta[0], ta[1], ta[2])
+                apply_rotor_forces(rigid_solver, link_idx, np.clip(th, 0.0, None))
                 scene.step()
             q_cur = body.get_quat().cpu().numpy()
             pos = body.get_pos().cpu().numpy()
@@ -1153,7 +1042,7 @@ def run_3d_stationary_scan():
         w1, w2, fl, ot = [], [], [], []
         w2_yspan = (-4.0, 4.0)
         for ray in rays:
-            R_bw = rot_world_to_body(ray['q']).T
+            R_bw = R_body_from_world(ray['q'])
             pos = ray['pos']
             theta = np.radians(ray['pitch_deg'])
             dir_body = np.array([np.cos(theta), 0.0, np.sin(theta)])
@@ -1306,9 +1195,9 @@ def run_3d_stationary_scan():
         v = body.get_vel().cpu().numpy()
         om = body.get_ang().cpu().numpy()
         Tt, qd = position_pd(np.array([0.0, 0.0, 1.0]), p, v)
-        ta = attitude_pd(qd, qc, om)
-        th = mixer(Tt, ta[0], ta[1], ta[2])
-        apply_rotor_forces(np.clip(th, 0.0, None))
+        ta, _ = attitude_pd(qd, qc, om)
+        th, _, _ = mixer(Tt, ta[0], ta[1], ta[2])
+        apply_rotor_forces(rigid_solver, link_idx, np.clip(th, 0.0, None))
         scene.step()
     data_post = argus_scan.read()
     r_post = data_post.distances.cpu().numpy().flatten()

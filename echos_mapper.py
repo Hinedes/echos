@@ -129,8 +129,8 @@ def run_mapping_mission():
             return True
         return False
 
-    # Confusion matrix
-    tp = fp = tn = fn = 0
+    # Confusion matrix (correct categories)
+    tp = fp = tn = fn = unk = 0
     for iy in range(mapper.h):
         for ix in range(mapper.w):
             wx, wy = mapper.g2w(ix, iy)
@@ -138,21 +138,26 @@ def run_mapping_mission():
             g_free = in_free(wx, wy)
             pred_occ = occ_map[iy, ix] == 1.0
             pred_free = occ_map[iy, ix] == 0.5
+            pred_unk = not pred_occ and not pred_free
             seen = mapper.views[iy, ix] > 0
-            if not seen: continue
-            if not g_wall and not g_free: continue
+            if not seen:
+                continue
+            if g_wall and g_free:
+                continue  # ambiguous ground truth
             if g_wall:
                 if pred_occ: tp += 1
-                else: fp += 1
+                elif pred_free: fn += 1
+                else: unk += 1
             if g_free:
                 if pred_free: tn += 1
-                else: fn += 1
+                elif pred_occ: fp += 1
+                else: unk += 1
 
     occ_prec = tp / (tp + fp) * 100 if tp + fp > 0 else 0
     free_prec = tn / (tn + fn) * 100 if tn + fn > 0 else 0
-    print(f"\n  Confusion matrix: TP={tp} FP={fp} TN={tn} FN={fn}")
-    print(f"  Occupied precision: {occ_prec:.1f}%")
-    print(f"  Free-space precision: {free_prec:.1f}%")
+    print(f"\n  Confusion: TP={tp} FP={fp} TN={tn} FN={fn} UNK={unk}")
+    print(f"  Occupied precision (TP/[TP+FP]): {occ_prec:.1f}%")
+    print(f"  Free precision (TN/[TN+FN]): {free_prec:.1f}%")
 
     print(f"\n{'='*50}")
     print(f"  Pass Criteria")
@@ -167,6 +172,7 @@ def run_mapping_mission():
 
     rtl_start_pos = trajectory[-1].copy()
     print(f"\n  MAPPING MISSION {'PASS' if passed else 'FAIL'}")
+    rtl_pass = False
 
     # RTL
     print(f"\n{'='*50}")
@@ -240,7 +246,7 @@ def run_mapping_mission():
         rtl_pass = not rtl_collision and rtl_d < 0.05 and rtl_clr > 0.20
         print(f"  RETURN-TO-LAUNCH {'PASS' if rtl_pass else 'FAIL'}")
 
-    return passed
+    return passed and rtl_pass
 
 if __name__ == "__main__":
     raise SystemExit(0 if run_mapping_mission() else 1)

@@ -361,8 +361,8 @@ def check_collision(body, body_h=BODY_H):
             geom_a = contacts.get("geom_a", [])
             if len(geom_a) > 0:
                 return True
-    except Exception:
-        pass
+    except Exception as e:
+        raise RuntimeError(f"check_collision: body.get_contacts() failed: {e}") from e
     return False
 
 # ---------------------------------------------------------------------------

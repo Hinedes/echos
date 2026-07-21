@@ -71,7 +71,19 @@ def frontier_clusters(occ, inf):
     return cs
 
 
+failed_frontiers = set()
+frontier_map_revision = 0
+
+def clear_failed_frontiers():
+    global failed_frontiers
+    failed_frontiers = set()
+
+def mark_frontier_failed(cix, ciy):
+    global failed_frontiers
+    failed_frontiers.add((cix, ciy))
+
 def select_frontier(occ, inf, cs, cur_pos, mapper):
+    global failed_frontiers
     sx, sy = mapper.w2g(cur_pos[0], cur_pos[1])
     best = None; bs = -1; cur_path = None
 
@@ -92,24 +104,24 @@ def select_frontier(occ, inf, cs, cur_pos, mapper):
         best_d = 1e9; gx, gy = cells[0]
         for (ix, iy) in cells:
             if not (occ[iy, ix] == 0.5 and inf[iy, ix] == 0): continue
+            if (ix, iy) in failed_frontiers: continue
             d = abs(ix - uc_x) + abs(iy - uc_y)
             if d < best_d: best_d = d; gx, gy = ix, iy
+
+        if (gx, gy) in failed_frontiers: continue
 
         pth = astar_path(inf, (sx, sy), (gx, gy))
         if pth is None: continue
 
-        gn = len(cells)
-        ct = sum(1 for i in range(len(pth)-1) for _ in [0])  # count steps
-        # Actual path cost
         path_cost = 0.0
         for i in range(1, len(pth)):
             dx = abs(pth[i][0] - pth[i-1][0])
             dy = abs(pth[i][1] - pth[i-1][1])
             path_cost += SQRT2 if (dx != 0 and dy != 0) else 1.0
         cost_m = path_cost * mapper.res
-        sc = gn / (cost_m + 0.01)
+        sc = len(cells) / (cost_m + 0.01)
         cl_info = {"cx": mapper.g2w(gx, gy)[0], "cy": mapper.g2w(gx, gy)[1],
-                   "cix": gx, "ciy": gy, "n": gn,
+                   "cix": gx, "ciy": gy, "n": len(cells),
                    "ucx": uc_x, "ucy": uc_y, "adj_unk_n": len(adj_unk)}
         if best is None or sc > bs:
             best = cl_info; bs = sc; cur_path = pth
@@ -231,9 +243,8 @@ def run_frontier_exploration():
                 print(f"    scan complete ({scan_steps} steps)")
             elif align_steps >= 200:
                 state = "EXPLORE"; state_changed = True
-                # Exclude this frontier from reselection
                 if best is not None:
-                    best["failed"] = True
+                    mark_frontier_failed(best["cix"], best["ciy"])
                 print(f"    ALIGN TIMEOUT at step {step} — abort frontier")
 
         # --- thrust computation (every iteration) ---
@@ -311,37 +322,60 @@ def run_frontier_exploration():
     rtl_d = np.linalg.norm(fpos[:2] - launch[:2])
     occ = mapper.get_map(); seen = mapper.views > 0
 
-    tp = 0; fp_val = 0
+    # Reachable ground-truth free-space coverage
+    reachable_cells = []
     for iy in range(mapper.h):
         for ix in range(mapper.w):
             wx, wy = mapper.g2w(ix, iy)
-            if not seen[iy, ix]: continue
-            in_corridor = (-0.3 <= wx <= 5.9 and -1.3 <= wy <= 1.3) or \
-                          (3.1 <= wx <= 5.9 and 1.3 <= wy <= 3.9)
-            if in_corridor:
-                if occ[iy, ix] == 0.5: tp += 1
-                else: fp_val += 1
-    fpr = tp / (tp + fp_val) * 100 if tp + fp_val > 0 else 0
-
-    tr = sum(1 for iy in range(mapper.h) for ix in range(mapper.w)
-             if (-0.3 <= mapper.g2w(ix, iy)[0] <= 5.9 and -1.3 <= mapper.g2w(ix, iy)[1] <= 1.3) or
-                (3.1 <= mapper.g2w(ix, iy)[0] <= 5.9 and 1.3 <= mapper.g2w(ix, iy)[1] <= 3.9))
-    te = sum(1 for iy in range(mapper.h) for ix in range(mapper.w)
-             if seen[iy, ix] and (
-                (-0.3 <= mapper.g2w(ix, iy)[0] <= 5.9 and -1.3 <= mapper.g2w(ix, iy)[1] <= 1.3) or
-                (3.1 <= mapper.g2w(ix, iy)[0] <= 5.9 and 1.3 <= mapper.g2w(ix, iy)[1] <= 3.9)))
+            in_horiz = -0.3 <= wx <= 5.9 and -1.3 <= wy <= 1.3
+            in_vert = 3.1 <= wx <= 5.9 and 1.3 <= wy <= 3.9
+            if in_horiz or in_vert:
+                reachable_cells.append((ix, iy))
+    tr = len(reachable_cells)
+    te = sum(1 for (ix, iy) in reachable_cells
+             if seen[iy, ix] and occ[iy, ix] == 0.5)
     er = te / tr * 100 if tr > 0 else 0
 
+    # Count legs with at least 3 free cells observed
+    horiz_leg_cells = [(ix, iy) for (ix, iy) in reachable_cells
+                       if mapper.g2w(ix, iy)[1] < 1.5]
+    vert_leg_cells = [(ix, iy) for (ix, iy) in reachable_cells
+                      if mapper.g2w(ix, iy)[0] >= 3.0]
+    horiz_discovered = sum(1 for (ix, iy) in horiz_leg_cells
+                           if seen[iy, ix] and occ[iy, ix] == 0.5) >= 3
+    vert_discovered = sum(1 for (ix, iy) in vert_leg_cells
+                          if seen[iy, ix] and occ[iy, ix] == 0.5) >= 3
+    both_legs = horiz_discovered and vert_discovered
+
+    # Count steps traversing through unknown cells
+    unknown_steps = 0
+    for tp in traj:
+        pix, piy = mapper.w2g(tp[0], tp[1])
+        if mapper.in_b(pix, piy) and occ[piy, pix] == 0.0:
+            unknown_steps += 1
+    zero_unknown = unknown_steps == 0
+
+    # Detect oscillation: same frontier selected within last 5
+    oscillation = False
+    if len(front_log) >= 3:
+        recent = [(fl["cx"], fl["cy"]) for fl in front_log[-5:]]
+        if len(set(recent)) < len(recent):
+            oscillation = True
+
     print(f"\n  Trajectory: {len(traj)} steps, final ({fpos[0]:.2f},{fpos[1]:.2f})")
-    print(f"  Frontiers: {len(front_log)}, explored {er:.1f}%, free prec {fpr:.1f}%")
-    print(f"  Min clearance: {min_clr:.4f}, RTL dist: {rtl_d:.4f}, collision: {collided}")
+    print(f"  Frontiers: {len(front_log)}, explored {er:.1f}%")
+    print(f"  Both legs: horiz={horiz_discovered} vert={vert_discovered}")
+    print(f"  Unknown traversal: {unknown_steps} steps")
+    print(f"  Oscillation: {oscillation}")
+    print(f"  RTL dist: {rtl_d:.4f}, collision: {collided}")
+    print(f"  Min clearance: {min_clr:.4f}")
 
     print("\n" + "="*50)
     print("  Pass Criteria")
     print("="*50)
     ok = True
-    er_pass = er >= 95.0; ok &= er_pass
-    print(f"  1. Explored >= 95%: {er:.1f}%  {'PASS' if er_pass else 'FAIL'}")
+    r1 = er >= 95.0; ok &= r1
+    print(f"  1. Explored >= 95%: {er:.1f}%  {'PASS' if r1 else 'FAIL'}")
     r2 = not collided; ok &= r2
     print(f"  2. No collision: {'PASS' if r2 else 'FAIL'}")
     r3 = min_clr > 0.20; ok &= r3
@@ -350,12 +384,14 @@ def run_frontier_exploration():
     print(f"  4. Frontiers found: {len(front_log)}  {'PASS' if r4 else 'FAIL'}")
     r5 = rtl_d < 0.05; ok &= r5
     print(f"  5. RTL within 5 cm: {rtl_d:.4f}  {'PASS' if r5 else 'FAIL'}")
-    dec_reasons = [d[1] for d in dec]
-    r6 = "NO_FRONTIER" in dec_reasons; ok &= r6
-    print(f"  6. Terminated by NO_FRONTIER: {r6}  {'PASS' if r6 else 'FAIL'}")
-    r7 = er_pass and r2 and r3 and r4 and r5 and r6
-    ok &= r7
-    print(f"  7. All primary gates pass: {'PASS' if r7 else 'FAIL'}")
+    r6 = both_legs; ok &= r6
+    print(f"  6. Both legs discovered: {'PASS' if r6 else 'FAIL'}")
+    r7 = zero_unknown; ok &= r7
+    print(f"  7. Zero unknown traversal: {unknown_steps} steps  {'PASS' if r7 else 'FAIL'}")
+    r8 = not oscillation; ok &= r8
+    print(f"  8. No frontier oscillation: {'PASS' if r8 else 'FAIL'}")
+    r9 = "NO_FRONTIER" in [d[1] for d in dec]; ok &= r9
+    print(f"  9. Terminated by NO_FRONTIER: {'PASS' if r9 else 'FAIL'}")
     print(f"\n  FRONTIER EXPLORATION {'PASS' if ok else 'FAIL'}")
     return ok
 

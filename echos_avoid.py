@@ -287,11 +287,11 @@ def run_avoidance_mission():
     passed &= ok6
     print(f"  6. No terminal-wall coords read (THROW range only): PASS")
 
-    ok7 = True
     print(f"\n  Deterministic repeatability check:")
+    results_runs = []
     for rep in range(2):
-        body.set_pos([0, 0, 1])
-        body.set_quat(np.array([1.0, 0.0, 0.0, 0.0]))
+        body.set_pos([0, 0, 1], zero_velocity=True)
+        body.set_quat(np.array([1.0, 0.0, 0.0, 0.0]), zero_velocity=True, relative=False)
         rigid_solver.clear_external_force()
         for _ in range(30):
             rigid_solver.clear_external_force()
@@ -305,10 +305,11 @@ def run_avoidance_mission():
             scene.step()
         d2 = argus_flood.read()
         r2 = d2.distances.cpu().numpy().flatten()
-        fwd2 = r2[3]
-        print(f"    Run {rep+1}: fwd_range={fwd2:.4f}")
+        results_runs.append(r2.copy())
+        print(f"    Run {rep+1}: fwd_range={r2[3]:.4f}")
+    ok7 = len(results_runs) == 2 and np.allclose(results_runs[0], results_runs[1])
     passed &= ok7
-    print(f"  7. Deterministic: {'PASS' if ok7 else 'FAIL'}")
+    print(f"  7. Deterministic (2 runs match): {'PASS' if ok7 else 'FAIL'}")
 
     print(f"\n  DUAL-MODE MISSION {'PASS' if passed else 'FAIL'}")
 

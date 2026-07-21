@@ -17,9 +17,12 @@ body = scene.add_entity(
     gs.morphs.Box(size=(BODY_W, BODY_D, BODY_H), pos=(0.0, 0.0, 1.0), fixed=False),
 )
 wall_surface_x = 3.0125  # front-wall surface
-wall_surface_y = 3.0125  # side-wall surface (analytic; raycaster cannot detect thin Y-boxes)
+wall_surface_y = 3.0125  # side-wall surface
 wall = scene.add_entity(
     gs.morphs.Box(size=(0.01, 4.0, 2.0), pos=(wall_surface_x + 0.005, 0.0, 1.0), fixed=True),
+)
+wall_y = scene.add_entity(
+    gs.morphs.Box(size=(4.0, 0.01, 2.0), pos=(0.0, wall_surface_y + 0.005, 1.0), fixed=True),
 )
 
 floor = scene.add_entity(
@@ -177,6 +180,7 @@ def run_pos_test(name, init_pos, pos_des, steps=600):
     print(f"  pos_err: {final_pos_err:.4f} m  |  att_err: {final_att_err:.4f} deg  |  "
           f"max_tilt: {max_tilt:.1f} deg  |  settle: {settle_step} steps  |  neg: {has_negative}")
     print(f"  {'PASS' if passed else 'FAIL'}")
+    return passed
 
 def run_waypoint_mission(waypoints, max_steps_per_leg=2000):
     reset_body(pos=waypoints[0])
@@ -890,7 +894,7 @@ def run_motion_scan():
                 'pos': pos.copy(), 'q': q_cur.copy(),
             })
 
-    R_bw_0 = R_body_from_world(q_0)
+    R_wb_0 = R_world_from_body(q_0)
     wall_comp, wall_uncomp = [], []
     floor_comp, floor_uncomp = [], []
     wall_steps, wall_pitches = [], []
@@ -901,9 +905,9 @@ def run_motion_scan():
             n_miss += 1
             continue
         n_valid += 1
-        R_bw = R_body_from_world(ray['q'])
-        pt_w = ray['pos'] + R_bw @ ray['pt_body']
-        pt_u = pos_0 + R_bw_0 @ ray['pt_body']
+        R_wb = R_world_from_body(ray['q'])
+        pt_w = ray['pos'] + R_wb @ ray['pt_body']
+        pt_u = pos_0 + R_wb_0 @ ray['pt_body']
         ray['pt_world'] = pt_w
         ray['pt_uncomp'] = pt_u
 
@@ -999,7 +1003,7 @@ def run_3d_stationary_scan():
     def acquire_scan(label=""):
         all_rays = []
         for yi, yaw_deg in enumerate(yaw_angles_deg):
-            psi_des = -np.radians(yaw_deg)
+            psi_des = np.radians(yaw_deg)
             _, q_des = position_pd(np.array([0.0, 0.0, 1.0]), np.zeros(3), np.zeros(3), psi_des)
             reset_body(pos=(0.0, 0.0, 1.0), quat=q_des)
             for _ in range(settle_steps):
@@ -1042,34 +1046,28 @@ def run_3d_stationary_scan():
         w1, w2, fl, ot = [], [], [], []
         w2_yspan = (-4.0, 4.0)
         for ray in rays:
-            R_bw = R_body_from_world(ray['q'])
+            R_wb = R_world_from_body(ray['q'])
             pos = ray['pos']
             theta = np.radians(ray['pitch_deg'])
             dir_body = np.array([np.cos(theta), 0.0, np.sin(theta)])
-            dir_world = R_bw @ dir_body
-            emitter_w = pos + R_bw @ np.array([emitter_offset[0], 0.0, 0.0])
+            dir_world = R_wb @ dir_body
+            emitter_w = pos + R_wb @ np.array([emitter_offset[0], 0.0, 0.0])
             if ray['valid']:
-                pt = ray['pos'] + R_bw @ ray['pt_body']
+                pt = ray['pos'] + R_wb @ ray['pt_body']
                 ray['pt_world'] = pt
                 on_xwall = abs(pt[0] - wall_surface_x) < 0.1 and abs(pt[2]) > 0.05
+                on_ywall = abs(pt[1] - wall_surface_y) < 0.1 and abs(pt[2]) > 0.05
                 on_floor = abs(pt[2]) < 0.1
                 if on_xwall:
                     w1.append(pt)
+                elif on_ywall:
+                    w2.append(pt)
                 elif on_floor:
                     fl.append(pt)
                 else:
                     ot.append(pt)
             else:
-                # Check analytic wall Y for missed rays
-                if dir_world[1] > 0:
-                    t_wy = (wall_surface_y - emitter_w[1]) / dir_world[1]
-                    x_wy = emitter_w[0] + t_wy * dir_world[0]
-                    z_wy = emitter_w[2] + t_wy * dir_world[2]
-                    if (w2_yspan[0] <= x_wy <= w2_yspan[1] and 0 <= z_wy <= 2.0
-                        and 0 < t_wy <= 10.0):
-                        pt_wy = np.array([x_wy, wall_surface_y, z_wy])
-                        w2.append(pt_wy)
-                        ray['pt_world'] = pt_wy
+                ot.append(None)
         return np.array(w1), np.array(w2), np.array(fl), np.array(ot)
 
     w1_1, w2_1, fl_1, ot_1 = classify_rays(rays1)

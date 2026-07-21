@@ -136,7 +136,7 @@ def attitude_pd(q_des, q_cur, omega_world):
 # ---------------------------------------------------------------------------
 # Motor mixer
 # ---------------------------------------------------------------------------
-def _wrench_from_thrusts(thrusts):
+def wrench_from_thrusts(thrusts):
     """Compute collective thrust and body torques from rotor thrusts.
     Matches the computation in apply_rotor_forces."""
     F_total = np.zeros(3)
@@ -167,15 +167,15 @@ def mixer_with_authority(T, tx, ty, tz=0.0):
     achieved_wrench = [T_achieved, tx_achieved, ty_achieved, tz_achieved]."""
     ts, sat, raw = mixer(T, tx, ty, tz)
     if not np.any(sat):
-        T_a, tau_a = _wrench_from_thrusts(ts)
+        T_a, tau_a = wrench_from_thrusts(ts)
         return ts, sat, np.array([T_a, tau_a[0], tau_a[1], tau_a[2]]), raw
     tz_reduced = tz * 0.5
     ts2, sat2, raw2 = mixer(T, tx, ty, tz_reduced)
     if not np.any(sat2):
-        T_a, tau_a = _wrench_from_thrusts(ts2)
+        T_a, tau_a = wrench_from_thrusts(ts2)
         return ts2, sat2, np.array([T_a, tau_a[0], tau_a[1], tau_a[2]]), raw2
     ts3, sat3, raw3 = mixer(T, tx, ty, 0.0)
-    T_a, tau_a = _wrench_from_thrusts(ts3)
+    T_a, tau_a = wrench_from_thrusts(ts3)
     return ts3, sat3, np.array([T_a, tau_a[0], tau_a[1], tau_a[2]]), raw3
 
 def apply_rotor_forces(rigid_solver, link_idx, thrusts):
@@ -217,36 +217,28 @@ class OccupancyMapper:
         return 0 <= ix < self.w and 0 <= iy < self.h
 
     def _supercover(self, x0, y0, x1, y1):
-        """Integer supercover line from (x0,y0) to (x1,y1).
-        Returns list of (ix, iy) cells traversed, INCLUSIVE of both endpoints."""
+        """Bresenham line traversal, integer arithmetic, all octants.
+        Returns list of (ix, iy) cells traversed from (x0,y0) to (x1,y1),
+        inclusive of both endpoints."""
         cells = []
         dx = abs(x1 - x0)
-        dy = abs(y1 - y0)
-        sx = 1 if x1 >= x0 else -1
-        sy = 1 if y1 >= y0 else -1
+        dy = -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        cx, cy = x0, y0
 
-        if dx >= dy:
-            err = dx / 2.0
-            cx, cy = x0, y0
-            while cx != x1 or cy != y1:
-                cells.append((cx, cy))
-                err -= dy
-                if err < 0:
-                    cy += sy
-                    err += dx
+        while True:
+            cells.append((cx, cy))
+            if cx == x1 and cy == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
                 cx += sx
-            cells.append((x1, y1))
-        else:
-            err = dy / 2.0
-            cx, cy = x0, y0
-            while cx != x1 or cy != y1:
-                cells.append((cx, cy))
-                err -= dx
-                if err < 0:
-                    cx += sx
-                    err += dy
+            if e2 <= dx:
+                err += dx
                 cy += sy
-            cells.append((x1, y1))
         return cells
 
     def update_ray(self, emitter, direction, raw_range, max_range, is_hit):
@@ -282,11 +274,7 @@ class OccupancyMapper:
         occ[(self.log_odds < 0) & (self.hits == 0)] = 0.5
         return occ
 
-    def get_views(self):
-        return self.views
-
-    def get_hits(self):
-        return self.hits
+    # ponytail: get_views/get_hits removed — dead code, callers used .views/.hits directly
 
 # ---------------------------------------------------------------------------
 # A* (octile heuristic)

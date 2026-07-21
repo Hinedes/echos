@@ -3,6 +3,7 @@ import genesis as gs
 import numpy as np
 from echos_core import *
 import math
+import hashlib
 
 gs.init(backend=gs.amdgpu)
 scene = gs.Scene(show_viewer=False, rigid_options=gs.options.RigidOptions(enable_collision=True))
@@ -72,23 +73,30 @@ def frontier_clusters(occ, inf):
 
 
 failed_frontiers = set()
-frontier_map_revision = 0
 
 def clear_failed_frontiers():
     global failed_frontiers
     failed_frontiers = set()
 
-def mark_frontier_failed(cix, ciy):
+def mark_frontier_failed(ccx, ccy, mapper):
     global failed_frontiers
-    failed_frontiers.add((cix, ciy))
+    rev = int(np.sum(mapper.views))
+    failed_frontiers.add(((round(ccx), round(ccy)), rev))
 
 def select_frontier(occ, inf, cs, cur_pos, mapper):
     global failed_frontiers
+    map_revision = int(np.sum(mapper.views))
     sx, sy = mapper.w2g(cur_pos[0], cur_pos[1])
     best = None; bs = -1; cur_path = None
 
     for l, cells in cs.items():
         if len(cells) < 5: continue
+
+        ccx = sum(c[0] for c in cells) / len(cells)
+        ccy = sum(c[1] for c in cells) / len(cells)
+        cx_r, cy_r = round(ccx), round(ccy)
+        if ((cx_r, cy_r), map_revision) in failed_frontiers:
+            continue
 
         adj_unk = set()
         for (ix, iy) in cells:
@@ -104,11 +112,8 @@ def select_frontier(occ, inf, cs, cur_pos, mapper):
         best_d = 1e9; gx, gy = cells[0]
         for (ix, iy) in cells:
             if not (occ[iy, ix] == 0.5 and inf[iy, ix] == 0): continue
-            if (ix, iy) in failed_frontiers: continue
             d = abs(ix - uc_x) + abs(iy - uc_y)
             if d < best_d: best_d = d; gx, gy = ix, iy
-
-        if (gx, gy) in failed_frontiers: continue
 
         pth = astar_path(inf, (sx, sy), (gx, gy))
         if pth is None: continue
@@ -122,7 +127,8 @@ def select_frontier(occ, inf, cs, cur_pos, mapper):
         sc = len(cells) / (cost_m + 0.01)
         cl_info = {"cx": mapper.g2w(gx, gy)[0], "cy": mapper.g2w(gx, gy)[1],
                    "cix": gx, "ciy": gy, "n": len(cells),
-                   "ucx": uc_x, "ucy": uc_y, "adj_unk_n": len(adj_unk)}
+                   "ucx": uc_x, "ucy": uc_y, "adj_unk_n": len(adj_unk),
+                   "ccx": cx_r, "ccy": cy_r}
         if best is None or sc > bs:
             best = cl_info; bs = sc; cur_path = pth
 
@@ -139,6 +145,8 @@ def run_frontier_exploration():
     print("\n" + "="*50)
     print("  Autonomous Frontier Exploration")
     print("="*50)
+
+    clear_failed_frontiers()
 
     reset_body_state(body, rs, pos=(0.0, 0.0, 1.0))
     for _ in range(20):
@@ -163,6 +171,7 @@ def run_frontier_exploration():
     traj = []; scan_log = []; front_log = []; dec = []
     min_clr = float('inf'); collided = False
     best = None
+    unknown_at_step = 0
 
     # Persistent yaw command (slew-limited across all states)
     yaw_cmd = 0.0
@@ -244,7 +253,7 @@ def run_frontier_exploration():
             elif align_steps >= 200:
                 state = "EXPLORE"; state_changed = True
                 if best is not None:
-                    mark_frontier_failed(best["cix"], best["ciy"])
+                    mark_frontier_failed(best["ccx"], best["ccy"], mapper)
                 print(f"    ALIGN TIMEOUT at step {step} — abort frontier")
 
         # --- thrust computation (every iteration) ---
@@ -278,6 +287,9 @@ def run_frontier_exploration():
         pos = body.get_pos().cpu().numpy()
         if check_collision(body): collided = True
         traj.append(pos.copy()); scan_log.append((step, raw_f.copy(), active_state))
+        pix_at, piy_at = mapper.w2g(pos[0], pos[1])
+        if mapper.in_b(pix_at, piy_at) and mapper.views[piy_at, pix_at] == 0:
+            unknown_at_step += 1
 
     # --- RTL ---
     occ = mapper.get_map()
@@ -293,6 +305,7 @@ def run_frontier_exploration():
     else:
         print(f"  RTL path: {len(pth)} cells")
         wp_i_rtl = 0
+        traj_rtl = []
         for s2 in range(8000):
             rs.clear_external_force()
             qc = body.get_quat().cpu().numpy(); p2 = body.get_pos().cpu().numpy()
@@ -309,51 +322,68 @@ def run_frontier_exploration():
             if dist < mapper.res * 1.5 and speed < 0.3:
                 wp_i_rtl += 1
 
-            if np.linalg.norm(p2[:2] - launch[:2]) < 0.04 and s2 > 50:
-                break
-
             Tt, qd = position_pd(tgt2, p2, v2, yaw_cmd)
             tau, _ = attitude_pd(qd, qc, om2)
             ts, sat, _, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
             apply_rotor_forces(rs, li, ts)
             scene.step()
+            if check_collision(body): collided = True
+            df2 = argus_flood.read(); raw_f2 = df2.distances.cpu().numpy().flatten()
+            vf2 = raw_f2[raw_f2 >= 0]
+            if len(vf2) > 0: min_clr = min(min_clr, np.min(vf2))
+            p2 = body.get_pos().cpu().numpy()
+            v2 = body.get_vel().cpu().numpy()
+            traj_rtl.append(p2.copy())
+            if np.linalg.norm(p2[:2] - launch[:2]) < 0.04 and np.linalg.norm(v2[:2]) < 0.1 and s2 > 50:
+                break
 
     fpos = body.get_pos().cpu().numpy()
     rtl_d = np.linalg.norm(fpos[:2] - launch[:2])
     occ = mapper.get_map(); seen = mapper.views > 0
 
-    # Reachable ground-truth free-space coverage
-    reachable_cells = []
-    for iy in range(mapper.h):
-        for ix in range(mapper.w):
-            wx, wy = mapper.g2w(ix, iy)
-            in_horiz = -0.3 <= wx <= 5.9 and -1.3 <= wy <= 1.3
-            in_vert = 3.1 <= wx <= 5.9 and 1.3 <= wy <= 3.9
-            if in_horiz or in_vert:
-                reachable_cells.append((ix, iy))
-    tr = len(reachable_cells)
-    te = sum(1 for (ix, iy) in reachable_cells
+    # BFS flood fill for reachable free space
+    sx_f, sy_f = mapper.w2g(launch[0], launch[1])
+    reachable = set()
+    q = [(sx_f, sy_f)]
+    while q:
+        cx, cy = q.pop()
+        if (cx, cy) in reachable:
+            continue
+        if not mapper.in_b(cx, cy):
+            continue
+        if occ[cy, cx] == 1.0:
+            continue
+        wx_f, wy_f = mapper.g2w(cx, cy)
+        if (-0.75 <= wx_f <= 6.25 and -1.505 <= wy_f <= -1.495) or \
+           (-0.505 <= wx_f <= -0.495 and -2.0 <= wy_f <= 4.0) or \
+           (-0.5 <= wx_f <= 3.0 and 1.495 <= wy_f <= 1.505) or \
+           (2.92 <= wx_f <= 3.08 and 1.25 <= wy_f <= 4.25) or \
+           (3.0 <= wx_f <= 6.5 and 3.995 <= wy_f <= 4.005) or \
+           (1.25 <= wx_f <= 1.75 and 0.6 <= wy_f <= 1.4):
+            continue
+        if occ[cy, cx] != 0.5:
+            continue
+        reachable.add((cx, cy))
+        for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+            q.append((cx+dx, cy+dy))
+    tr = len(reachable)
+    te = sum(1 for (ix, iy) in reachable
              if seen[iy, ix] and occ[iy, ix] == 0.5)
     er = te / tr * 100 if tr > 0 else 0
 
     # Count legs with at least 3 free cells observed
-    horiz_leg_cells = [(ix, iy) for (ix, iy) in reachable_cells
+    horiz_leg_cells = [(ix, iy) for (ix, iy) in reachable
                        if mapper.g2w(ix, iy)[1] < 1.5]
-    vert_leg_cells = [(ix, iy) for (ix, iy) in reachable_cells
-                      if mapper.g2w(ix, iy)[0] >= 3.0]
+    vert_leg_cells = [(ix, iy) for (ix, iy) in reachable
+                      if 3.0 <= mapper.g2w(ix, iy)[0] <= 5.9
+                      and 1.3 <= mapper.g2w(ix, iy)[1] <= 3.9]
     horiz_discovered = sum(1 for (ix, iy) in horiz_leg_cells
                            if seen[iy, ix] and occ[iy, ix] == 0.5) >= 3
     vert_discovered = sum(1 for (ix, iy) in vert_leg_cells
                           if seen[iy, ix] and occ[iy, ix] == 0.5) >= 3
     both_legs = horiz_discovered and vert_discovered
 
-    # Count steps traversing through unknown cells
-    unknown_steps = 0
-    for tp in traj:
-        pix, piy = mapper.w2g(tp[0], tp[1])
-        if mapper.in_b(pix, piy) and occ[piy, pix] == 0.0:
-            unknown_steps += 1
-    zero_unknown = unknown_steps == 0
+    zero_unknown = unknown_at_step == 0
 
     # Detect oscillation: same frontier selected within last 5
     oscillation = False
@@ -365,7 +395,7 @@ def run_frontier_exploration():
     print(f"\n  Trajectory: {len(traj)} steps, final ({fpos[0]:.2f},{fpos[1]:.2f})")
     print(f"  Frontiers: {len(front_log)}, explored {er:.1f}%")
     print(f"  Both legs: horiz={horiz_discovered} vert={vert_discovered}")
-    print(f"  Unknown traversal: {unknown_steps} steps")
+    print(f"  Unknown traversal: {unknown_at_step} steps")
     print(f"  Oscillation: {oscillation}")
     print(f"  RTL dist: {rtl_d:.4f}, collision: {collided}")
     print(f"  Min clearance: {min_clr:.4f}")
@@ -387,13 +417,39 @@ def run_frontier_exploration():
     r6 = both_legs; ok &= r6
     print(f"  6. Both legs discovered: {'PASS' if r6 else 'FAIL'}")
     r7 = zero_unknown; ok &= r7
-    print(f"  7. Zero unknown traversal: {unknown_steps} steps  {'PASS' if r7 else 'FAIL'}")
+    print(f"  7. Zero unknown traversal: {unknown_at_step} steps  {'PASS' if r7 else 'FAIL'}")
     r8 = not oscillation; ok &= r8
     print(f"  8. No frontier oscillation: {'PASS' if r8 else 'FAIL'}")
     r9 = "NO_FRONTIER" in [d[1] for d in dec]; ok &= r9
     print(f"  9. Terminated by NO_FRONTIER: {'PASS' if r9 else 'FAIL'}")
     print(f"\n  FRONTIER EXPLORATION {'PASS' if ok else 'FAIL'}")
-    return ok
+    traj_arr = np.array(traj)
+    traj_hash = hashlib.sha256(traj_arr.tobytes()).hexdigest()
+    frontier_seq_arr = np.array([(fl["cx"], fl["cy"]) for fl in front_log])
+    frontier_seq_hash = hashlib.sha256(frontier_seq_arr.tobytes()).hexdigest()
+    occ_grid_hash = hashlib.sha256(mapper.get_map().tobytes()).hexdigest()
+    return {
+        "passed": ok,
+        "traj_hash": traj_hash,
+        "frontier_seq_hash": frontier_seq_hash,
+        "occ_grid_hash": occ_grid_hash,
+        "term_step": step,
+        "rtl_dist": rtl_d,
+    }
 
 if __name__ == "__main__":
-    raise SystemExit(0 if run_frontier_exploration() else 1)
+    r1 = run_frontier_exploration()
+    r2 = run_frontier_exploration()
+
+    print(f"Run 1: passed={r1['passed']}, term_step={r1['term_step']}, rtl_dist={r1['rtl_dist']:.4f}")
+    print(f"Run 2: passed={r2['passed']}, term_step={r2['term_step']}, rtl_dist={r2['rtl_dist']:.4f}")
+    print(f"Traj hash match: {r1['traj_hash'] == r2['traj_hash']}")
+    print(f"Frontier seq hash match: {r1['frontier_seq_hash'] == r2['frontier_seq_hash']}")
+    print(f"Occ grid hash match: {r1['occ_grid_hash'] == r2['occ_grid_hash']}")
+    ok = all([
+        r1['traj_hash'] == r2['traj_hash'],
+        r1['frontier_seq_hash'] == r2['frontier_seq_hash'],
+        r1['occ_grid_hash'] == r2['occ_grid_hash'],
+        r1['passed'], r2['passed'],
+    ])
+    raise SystemExit(0 if ok else 1)

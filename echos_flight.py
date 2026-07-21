@@ -107,10 +107,7 @@ def tilt_deg(q):
 
 # imported from echos_core
 def reset_body(pos=(0.0, 0.0, 1.0), quat=None):
-    body.set_pos(pos)
-    q = quat if quat is not None else np.array([1.0, 0.0, 0.0, 0.0])
-    body.set_quat(q)
-    rigid_solver.clear_external_force()
+    reset_body_state(body, rigid_solver, pos, quat)
 
 def run_pos_test(name, init_pos, pos_des, steps=600):
     reset_body(pos=init_pos)
@@ -620,13 +617,17 @@ def run_yaw_error_test():
 
 
 def read_argus(sensor, settle_steps=5):
+    start_pos = body.get_pos().cpu().numpy().copy()
+    start_q = body.get_quat().cpu().numpy().copy()
+    _, _, start_yaw_deg = quat_to_euler(start_q)
+    start_yaw_rad = np.radians(start_yaw_deg)
     for _ in range(settle_steps):
         rigid_solver.clear_external_force()
         q_cur = body.get_quat().cpu().numpy()
         pos = body.get_pos().cpu().numpy()
         vel = body.get_vel().cpu().numpy()
         omega_w = body.get_ang().cpu().numpy()
-        T_total, q_des = position_pd(np.array([0.0, 0.0, 1.0]), pos, vel)
+        T_total, q_des = position_pd(start_pos, pos, vel, start_yaw_rad)
         tau, _ = attitude_pd(q_des, q_cur, omega_w)
         thrusts, _, _ = mixer(T_total, tau[0], tau[1], tau[2])
         thrusts = np.clip(thrusts, 0.0, None)

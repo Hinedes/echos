@@ -1,7 +1,8 @@
 """Shared geometry, dynamics, controller, mapper, and path utilities."""
-import math
-import numpy as np
 import heapq
+import math
+
+import numpy as np
 
 # ---------------------------------------------------------------------------
 # Physical constants & geometry
@@ -24,82 +25,153 @@ MAX_YAW_RATE = 3.0
 
 ROTOR_GEOM = [
     np.array([ARM, -ARM, 0.0]),
-    np.array([ARM,  ARM, 0.0]),
+    np.array([ARM, ARM, 0.0]),
     np.array([-ARM, -ARM, 0.0]),
-    np.array([-ARM,  ARM, 0.0]),
+    np.array([-ARM, ARM, 0.0]),
 ]
 YAW_SIGNS = [1, -1, -1, 1]
 
 PHYSICAL_EMITTER = BODY_W / 2
 RAYCAST_ORIGIN = BODY_W / 2 + 0.004
 
+
 # ---------------------------------------------------------------------------
-# Frame utilities
+# Quaternion and frame utilities
 # ---------------------------------------------------------------------------
+def normalize_quat(q):
+    """Return a finite unit quaternion in ``[w, x, y, z]`` order."""
+    q = np.asarray(q, dtype=float)
+    norm = np.linalg.norm(q)
+    if not np.isfinite(norm) or norm < 1e-12:
+        raise ValueError("quaternion must have a finite, non-zero norm")
+    return q / norm
+
+
 def R_world_from_body(q):
-    w, x, y, z = q
-    return np.array([
-        [1 - 2*(y*y + z*z), 2*(x*y - w*z),     2*(x*z + w*y)],
-        [2*(x*y + w*z),     1 - 2*(x*x + z*z), 2*(y*z - w*x)],
-        [2*(x*z - w*y),     2*(y*z + w*x),     1 - 2*(x*x + y*y)],
-    ])
+    w, x, y, z = normalize_quat(q)
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ]
+    )
+
 
 def R_body_from_world(q):
     return R_world_from_body(q).T
 
-# ---------------------------------------------------------------------------
-# Quaternion utilities
-# ---------------------------------------------------------------------------
+
 def quat_conj(q):
-    w, x, y, z = q; return np.array([w, -x, -y, -z])
+    w, x, y, z = np.asarray(q, dtype=float)
+    return np.array([w, -x, -y, -z])
+
 
 def quat_mul(q1, q2):
-    w1, x1, y1, z1 = q1; w2, x2, y2, z2 = q2
-    return np.array([
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2,
-    ])
+    w1, x1, y1, z1 = np.asarray(q1, dtype=float)
+    w2, x2, y2, z2 = np.asarray(q2, dtype=float)
+    return np.array(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ]
+    )
+
 
 def quat_to_euler(q):
-    w, x, y, z = q
-    roll = np.arctan2(2.0*(w*x + y*z), 1.0 - 2.0*(x*x + y*y))
-    pitch = np.arcsin(np.clip(2.0*(w*y - z*x), -1.0, 1.0))
-    yaw = np.arctan2(2.0*(w*z + x*y), 1.0 - 2.0*(y*y + z*z))
+    w, x, y, z = normalize_quat(q)
+    roll = np.arctan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    pitch = np.arcsin(np.clip(2.0 * (w * y - z * x), -1.0, 1.0))
+    yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
     return np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
 
+
 def quat_from_R(R):
+    """Convert a proper rotation matrix to a normalized quaternion."""
+    R = np.asarray(R, dtype=float)
+    if R.shape != (3, 3) or not np.all(np.isfinite(R)):
+        raise ValueError("R must be a finite 3x3 matrix")
+
     t = np.trace(R)
-    if t > 0:
-        s = 0.5 / np.sqrt(t + 1.0)
-        return np.array([0.25 / s, (R[2,1] - R[1,2]) * s, (R[0,2] - R[2,0]) * s, (R[1,0] - R[0,1]) * s])
-    if R[0,0] > R[1,1] and R[0,0] > R[2,2]:
-        s = 2.0 * np.sqrt(max(0.0, 1.0 + R[0,0] - R[1,1] - R[2,2]))
-        return np.array([(R[2,1] - R[1,2]) / s, 0.25 * s, (R[0,1] + R[1,0]) / s, (R[0,2] + R[2,0]) / s])
-    if R[1,1] > R[2,2]:
-        s = 2.0 * np.sqrt(max(0.0, 1.0 + R[1,1] - R[0,0] - R[2,2]))
-        return np.array([(R[0,2] - R[2,0]) / s, (R[0,1] + R[1,0]) / s, 0.25 * s, (R[1,2] + R[2,1]) / s])
-    s = 2.0 * np.sqrt(max(0.0, 1.0 + R[2,2] - R[0,0] - R[1,1]))
-    return np.array([(R[1,0] - R[0,1]) / s, (R[0,2] + R[2,0]) / s, (R[1,2] + R[2,1]) / s, 0.25 * s])
+    if t > 0.0:
+        s = 2.0 * np.sqrt(max(0.0, t + 1.0))
+        q = np.array(
+            [
+                0.25 * s,
+                (R[2, 1] - R[1, 2]) / s,
+                (R[0, 2] - R[2, 0]) / s,
+                (R[1, 0] - R[0, 1]) / s,
+            ]
+        )
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * np.sqrt(max(0.0, 1.0 + R[0, 0] - R[1, 1] - R[2, 2]))
+        q = np.array(
+            [
+                (R[2, 1] - R[1, 2]) / s,
+                0.25 * s,
+                (R[0, 1] + R[1, 0]) / s,
+                (R[0, 2] + R[2, 0]) / s,
+            ]
+        )
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * np.sqrt(max(0.0, 1.0 + R[1, 1] - R[0, 0] - R[2, 2]))
+        q = np.array(
+            [
+                (R[0, 2] - R[2, 0]) / s,
+                (R[0, 1] + R[1, 0]) / s,
+                0.25 * s,
+                (R[1, 2] + R[2, 1]) / s,
+            ]
+        )
+    else:
+        s = 2.0 * np.sqrt(max(0.0, 1.0 + R[2, 2] - R[0, 0] - R[1, 1]))
+        q = np.array(
+            [
+                (R[1, 0] - R[0, 1]) / s,
+                (R[0, 2] + R[2, 0]) / s,
+                (R[1, 2] + R[2, 1]) / s,
+                0.25 * s,
+            ]
+        )
+    return normalize_quat(q)
+
 
 def quat_from_z_yaw(z_des, psi_des):
+    """Construct attitude from desired body-Z direction and world yaw.
+
+    The fallback basis is chosen from the world axis least parallel to
+    ``z_des``.  This avoids the previous singular fallback that could produce
+    a zero X axis when the requested thrust direction aligned with +Y.
+    """
+    z_des = np.asarray(z_des, dtype=float)
+    z_norm = np.linalg.norm(z_des)
+    if not np.isfinite(z_norm) or z_norm < 1e-12:
+        raise ValueError("z_des must have a finite, non-zero norm")
+    zn = z_des / z_norm
+
     x_c = np.array([np.cos(psi_des), np.sin(psi_des), 0.0])
-    zn = z_des / np.linalg.norm(z_des)
     y_des = np.cross(zn, x_c)
-    yn = np.linalg.norm(y_des)
-    if yn < 1e-10:
-        y_des = np.array([0.0, 1.0, 0.0])
-    else:
-        y_des = y_des / yn
+    if np.linalg.norm(y_des) < 1e-10:
+        candidates = np.eye(3)
+        fallback = candidates[int(np.argmin(np.abs(candidates @ zn)))]
+        y_des = np.cross(zn, fallback)
+    y_des /= np.linalg.norm(y_des)
     x_des = np.cross(y_des, zn)
+    x_des /= np.linalg.norm(x_des)
     return quat_from_R(np.column_stack([x_des, y_des, zn]))
 
+
 def quat_error_angle(qe):
-    return 2.0 * np.arccos(np.clip(qe[0], -1.0, 1.0))
+    """Return the shortest angular distance represented by a quaternion."""
+    qe = normalize_quat(qe)
+    return 2.0 * np.arccos(np.clip(abs(qe[0]), 0.0, 1.0))
+
 
 def quat_attitude_error(qd, qc):
-    return quat_mul(quat_conj(qd), qc)
+    return normalize_quat(quat_mul(quat_conj(normalize_quat(qd)), normalize_quat(qc)))
+
 
 # ---------------------------------------------------------------------------
 # Yaw utilities
@@ -107,9 +179,11 @@ def quat_attitude_error(qd, qc):
 def angle_diff(target, current):
     return math.atan2(math.sin(target - current), math.cos(target - current))
 
+
 def move_toward_angle(current, target, max_step):
     diff = angle_diff(target, current)
     return current + np.clip(diff, -max_step, max_step)
+
 
 # ---------------------------------------------------------------------------
 # Controller
@@ -125,6 +199,7 @@ def position_pd(pos_des, pos_cur, vel_cur, psi_des=0.0):
         return MASS * G, np.array([1.0, 0.0, 0.0, 0.0])
     return T_total, quat_from_z_yaw(T_vec / T_total, psi_des)
 
+
 def attitude_pd(q_des, q_cur, omega_world):
     qe = quat_attitude_error(q_des, q_cur)
     sign = 1.0 if qe[0] >= 0.0 else -1.0
@@ -133,12 +208,12 @@ def attitude_pd(q_des, q_cur, omega_world):
     tau = -KP_ATT * e_R - KD_ATT * omega_body
     return tau, qe
 
+
 # ---------------------------------------------------------------------------
 # Motor mixer
 # ---------------------------------------------------------------------------
 def wrench_from_thrusts(thrusts):
-    """Compute collective thrust and body torques from rotor thrusts.
-    Matches the computation in apply_rotor_forces."""
+    """Compute collective thrust and body torques from rotor thrusts."""
     F_total = np.zeros(3)
     tau_total = np.zeros(3)
     for i, (r, f) in enumerate(zip(ROTOR_GEOM, thrusts)):
@@ -146,37 +221,41 @@ def wrench_from_thrusts(thrusts):
         tau_total += np.cross(r, F)
         tau_total[2] += ARM * YAW_SIGNS[i] * f
         F_total += F
-    return F_total[2], tau_total  # T, [tx, ty, tz]
+    return F_total[2], tau_total
+
 
 def mixer(T, tx, ty, tz=0.0):
-    """Returns (thrusts, saturated_mask, thrusts_raw).
-    Clips to [0, MAX_THRUST]."""
+    """Return ``(thrusts, saturated_mask, raw_thrusts)``."""
     inv = 1.0 / (4.0 * ARM)
-    ts_raw = np.array([
-        T/4.0 - tx*inv - ty*inv + tz*inv,
-        T/4.0 + tx*inv - ty*inv - tz*inv,
-        T/4.0 - tx*inv + ty*inv - tz*inv,
-        T/4.0 + tx*inv + ty*inv + tz*inv,
-    ])
+    ts_raw = np.array(
+        [
+            T / 4.0 - tx * inv - ty * inv + tz * inv,
+            T / 4.0 + tx * inv - ty * inv - tz * inv,
+            T / 4.0 - tx * inv + ty * inv - tz * inv,
+            T / 4.0 + tx * inv + ty * inv + tz * inv,
+        ]
+    )
     ts = np.clip(ts_raw, 0.0, MAX_THRUST)
-    return ts, ts != ts_raw, ts_raw
+    return ts, np.not_equal(ts, ts_raw), ts_raw
+
 
 def mixer_with_authority(T, tx, ty, tz=0.0):
-    """Returns (thrusts, saturated_mask, achieved_wrench, thrusts_raw).
-    Yaw torque is deprioritised on saturation.
-    achieved_wrench = [T_achieved, tx_achieved, ty_achieved, tz_achieved]."""
+    """Mix a wrench, dropping yaw before roll/pitch when saturation occurs."""
     ts, sat, raw = mixer(T, tx, ty, tz)
     if not np.any(sat):
         T_a, tau_a = wrench_from_thrusts(ts)
         return ts, sat, np.array([T_a, tau_a[0], tau_a[1], tau_a[2]]), raw
+
     tz_reduced = tz * 0.5
     ts2, sat2, raw2 = mixer(T, tx, ty, tz_reduced)
     if not np.any(sat2):
         T_a, tau_a = wrench_from_thrusts(ts2)
         return ts2, sat2, np.array([T_a, tau_a[0], tau_a[1], tau_a[2]]), raw2
+
     ts3, sat3, raw3 = mixer(T, tx, ty, 0.0)
     T_a, tau_a = wrench_from_thrusts(ts3)
     return ts3, sat3, np.array([T_a, tau_a[0], tau_a[1], tau_a[2]]), raw3
+
 
 def apply_rotor_forces(rigid_solver, link_idx, thrusts):
     F_total = np.zeros(3)
@@ -187,20 +266,28 @@ def apply_rotor_forces(rigid_solver, link_idx, thrusts):
         tau_total[2] += ARM * YAW_SIGNS[i] * f
         F_total += F
     rigid_solver.apply_links_external_force(
-        force=F_total.reshape(1, 3), links_idx=[link_idx], ref="link_origin", local=True)
+        force=F_total.reshape(1, 3), links_idx=[link_idx], ref="link_origin", local=True
+    )
     rigid_solver.apply_links_external_torque(
-        torque=tau_total.reshape(1, 3), links_idx=[link_idx], ref="link_origin", local=True)
+        torque=tau_total.reshape(1, 3), links_idx=[link_idx], ref="link_origin", local=True
+    )
+
 
 # ---------------------------------------------------------------------------
-# Occupancy Grid Mapper — supercover traversal
+# Occupancy Grid Mapper — true supercover traversal
 # ---------------------------------------------------------------------------
 OCC_WEIGHT = 5
 FREE_WEIGHT = 1
 
+
 class OccupancyMapper:
     def __init__(self, bounds, resolution=0.08):
+        if resolution <= 0.0:
+            raise ValueError("resolution must be positive")
         self.res = resolution
         self.x_min, self.x_max, self.y_min, self.y_max = bounds
+        if self.x_max <= self.x_min or self.y_max <= self.y_min:
+            raise ValueError("bounds must have positive width and height")
         self.w = int((self.x_max - self.x_min) / self.res) + 1
         self.h = int((self.y_max - self.y_min) / self.res) + 1
         self.hits = np.zeros((self.h, self.w), dtype=np.int32)
@@ -217,36 +304,59 @@ class OccupancyMapper:
         return 0 <= ix < self.w and 0 <= iy < self.h
 
     def _supercover(self, x0, y0, x1, y1):
-        """Bresenham line traversal, integer arithmetic, all octants.
-        Returns list of (ix, iy) cells traversed from (x0,y0) to (x1,y1),
-        inclusive of both endpoints."""
-        cells = []
-        dx = abs(x1 - x0)
-        dy = -abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err = dx + dy
-        cx, cy = x0, y0
+        """Return every grid cell touched by the segment, in traversal order.
 
-        while True:
-            cells.append((cx, cy))
-            if cx == x1 and cy == y1:
-                break
-            e2 = 2 * err
-            if e2 >= dy:
-                err += dy
-                cx += sx
-            if e2 <= dx:
-                err += dx
-                cy += sy
+        Unlike standard Bresenham, exact corner crossings include both
+        side-adjacent cells.  This prevents diagonal rays from leaving
+        unobserved pinholes in the occupancy grid.
+        """
+        x0, y0, x1, y1 = map(int, (x0, y0, x1, y1))
+        dx = x1 - x0
+        dy = y1 - y0
+        nx = abs(dx)
+        ny = abs(dy)
+        sx = 0 if dx == 0 else (1 if dx > 0 else -1)
+        sy = 0 if dy == 0 else (1 if dy > 0 else -1)
+
+        x, y = x0, y0
+        ix = iy = 0
+        cells = [(x, y)]
+
+        while ix < nx or iy < ny:
+            decision = (1 + 2 * ix) * ny - (1 + 2 * iy) * nx
+            if decision == 0:
+                side_x = (x + sx, y)
+                side_y = (x, y + sy)
+                if side_x != cells[-1]:
+                    cells.append(side_x)
+                if side_y != cells[-1]:
+                    cells.append(side_y)
+                x += sx
+                y += sy
+                ix += 1
+                iy += 1
+            elif decision < 0:
+                x += sx
+                ix += 1
+            else:
+                y += sy
+                iy += 1
+            if (x, y) != cells[-1]:
+                cells.append((x, y))
+
         return cells
 
     def update_ray(self, emitter, direction, raw_range, max_range, is_hit):
-        """Supercover ray update.
-        No extra eps added — raw_range is the Genesis-measured distance.
-        hit: traversed except final → free; final cell → occupied.
-        no-hit: every traversed cell including final → free.
-        same-cell: that cell → occupied if hit, free if miss."""
+        """Update free and occupied evidence along one measured ray."""
+        emitter = np.asarray(emitter, dtype=float)
+        direction = np.asarray(direction, dtype=float)
+        if emitter.size < 2 or direction.size < 2:
+            raise ValueError("emitter and direction must have at least two components")
+        if not np.all(np.isfinite(emitter[:2])) or not np.all(np.isfinite(direction[:2])):
+            raise ValueError("emitter and direction must be finite")
+        if max_range < 0.0 or (is_hit and raw_range < 0.0):
+            raise ValueError("ray ranges must be non-negative")
+
         ex, ey = emitter[0], emitter[1]
         rng = raw_range if is_hit else max_range
         end_x = ex + direction[0] * rng
@@ -254,13 +364,12 @@ class OccupancyMapper:
 
         ix0, iy0 = self.w2g(ex, ey)
         ix1, iy1 = self.w2g(end_x, end_y)
-
         cells = self._supercover(ix0, iy0, ix1, iy1)
 
         for i, (cx, cy) in enumerate(cells):
             if not self.in_b(cx, cy):
                 continue
-            is_terminal = (i == len(cells) - 1)
+            is_terminal = i == len(cells) - 1
             if is_terminal and is_hit:
                 self.log_odds[cy, cx] += OCC_WEIGHT
                 self.hits[cy, cx] += 1
@@ -274,72 +383,92 @@ class OccupancyMapper:
         occ[(self.log_odds < 0) & (self.hits == 0)] = 0.5
         return occ
 
-    # ponytail: get_views/get_hits removed — dead code, callers used .views/.hits directly
 
 # ---------------------------------------------------------------------------
 # A* (octile heuristic)
 # ---------------------------------------------------------------------------
 SQRT2 = math.sqrt(2.0)
 
+
 def astar_path(inflation_grid, start, goal):
-    h, w = inflation_grid.shape; sx, sy = start; gx, gy = goal
+    h, w = inflation_grid.shape
+    sx, sy = start
+    gx, gy = goal
 
     def free(ix, iy):
         return 0 <= ix < w and 0 <= iy < h and inflation_grid[iy, ix] == 0
+
     if not free(sx, sy) or not free(gx, gy):
         return None
 
     def heuristic(ix, iy):
-        dx = abs(ix - gx); dy = abs(iy - gy)
+        dx = abs(ix - gx)
+        dy = abs(iy - gy)
         return max(dx, dy) + (SQRT2 - 1.0) * min(dx, dy)
 
-    opens = [(heuristic(sx, sy), (sx, sy))]; came = {}; g_c = {(sx, sy): 0}
+    opens = [(heuristic(sx, sy), (sx, sy))]
+    came = {}
+    g_c = {(sx, sy): 0.0}
+    closed = set()
 
     while opens:
         _, cur = heapq.heappop(opens)
+        if cur in closed:
+            continue
         if cur == (gx, gy):
-            pth = []; c = cur
-            while c in came: pth.append(c); c = came[c]
-            pth.append((sx, sy)); pth.reverse(); return pth
+            pth = []
+            c = cur
+            while c in came:
+                pth.append(c)
+                c = came[c]
+            pth.append((sx, sy))
+            pth.reverse()
+            return pth
+        closed.add(cur)
+
         cx, cy = cur
-        for dx, dy in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]:
-            nx, ny = cx+dx, cy+dy
-            if not free(nx, ny): continue
-            if dx != 0 and dy != 0:
-                if not free(cx+dx, cy) or not free(cx, cy+dy): continue
-            cost = SQRT2 if (dx != 0 and dy != 0) else 1.0
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+            nx, ny = cx + dx, cy + dy
+            if not free(nx, ny):
+                continue
+            if dx != 0 and dy != 0 and (not free(cx + dx, cy) or not free(cx, cy + dy)):
+                continue
+            cost = SQRT2 if dx != 0 and dy != 0 else 1.0
             ng = g_c[cur] + cost
-            if (nx, ny) not in g_c or ng < g_c[(nx, ny)]:
-                came[(nx, ny)] = cur; g_c[(nx, ny)] = ng
+            if ng < g_c.get((nx, ny), float("inf")):
+                came[(nx, ny)] = cur
+                g_c[(nx, ny)] = ng
                 heapq.heappush(opens, (ng + heuristic(nx, ny), (nx, ny)))
     return None
+
 
 # ---------------------------------------------------------------------------
 # Obstacle inflation
 # ---------------------------------------------------------------------------
 def inflation_grid(mapper, inflate_r=4):
-    occ = mapper.get_map(); h, w = occ.shape
+    if inflate_r < 0:
+        raise ValueError("inflate_r must be non-negative")
+    occ = mapper.get_map()
+    h, w = occ.shape
     inf = np.ones((h, w))
-    for iy in range(h):
-        for ix in range(w):
-            if occ[iy, ix] == 0.5: inf[iy, ix] = 0.0
+    inf[occ == 0.5] = 0.0
     for iy in range(h):
         for ix in range(w):
             if occ[iy, ix] == 1.0:
-                for dy in range(-inflate_r, inflate_r+1):
-                    for dx in range(-inflate_r, inflate_r+1):
-                        nx, ny = ix+dx, iy+dy
+                for dy in range(-inflate_r, inflate_r + 1):
+                    for dx in range(-inflate_r, inflate_r + 1):
+                        nx, ny = ix + dx, iy + dy
                         if 0 <= nx < w and 0 <= ny < h and occ[ny, nx] == 0.5:
                             inf[ny, nx] = 1.0
     inf[occ == 0.0] = 1.0
     return inf
 
+
 # ---------------------------------------------------------------------------
 # Collision detection
 # ---------------------------------------------------------------------------
 def check_collision(body, body_h=BODY_H):
-    """Check ground collision and Genesis body contact state.
-    Returns True if any collision is detected."""
+    """Check ground collision and Genesis body contact state."""
     pos = body.get_pos().cpu().numpy()
     if pos[2] <= body_h / 2 + 0.005:
         return True
@@ -349,19 +478,21 @@ def check_collision(body, body_h=BODY_H):
             geom_a = contacts.get("geom_a", [])
             if len(geom_a) > 0:
                 return True
-    except Exception as e:
-        raise RuntimeError(f"check_collision: body.get_contacts() failed: {e}") from e
+    except Exception as exc:
+        raise RuntimeError(f"check_collision: body.get_contacts() failed: {exc}") from exc
     return False
+
 
 # ---------------------------------------------------------------------------
 # Reset helpers
 # ---------------------------------------------------------------------------
 def reset_body_state(body, rigid_solver, pos=(0.0, 0.0, 1.0), quat=None):
     """Reset body with zero velocity."""
-    q = quat if quat is not None else np.array([1.0, 0.0, 0.0, 0.0])
+    q = normalize_quat(quat) if quat is not None else np.array([1.0, 0.0, 0.0, 0.0])
     body.set_pos(pos, zero_velocity=True)
     body.set_quat(q, zero_velocity=True, relative=False)
     rigid_solver.clear_external_force()
+
 
 # ---------------------------------------------------------------------------
 # Bootstrap target

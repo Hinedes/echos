@@ -1,6 +1,7 @@
 import genesis as gs
 import numpy as np
 from echos_core import *
+from argus_export import GimbalState, TrajectoryRecorder
 
 gs.init(backend=gs.amdgpu)
 
@@ -55,6 +56,7 @@ argus_15deg = scene.add_sensor(
 )
 pitch_angles_deg = np.arange(-30, 31, 5)
 n_pitch = len(pitch_angles_deg)
+SIM_DT_S = 0.01
 scan_pattern = gs.sensors.SphericalPattern(
     fov=(0.0, 60.0),
     n_points=(1, n_pitch),
@@ -694,6 +696,36 @@ def run_argus_tests():
     return passed
 
 
+def run_argus_trajectory_export(path="/workspace/echos_argus_trajectory.npz", steps=120):
+    """Record a fresh Genesis trajectory using the actual ARGUS sensor state."""
+    if steps < 2:
+        raise ValueError("steps must be at least two")
+    reset_body(pos=(0.0, 0.0, 1.0))
+    recorder = TrajectoryRecorder(physics_dt_s=SIM_DT_S, control_dt_s=SIM_DT_S)
+    for step in range(steps):
+        use_pitch = step >= steps // 2
+        sensor = argus_15deg if use_pitch else argus_0deg
+        pitch = np.radians(15.0) if use_pitch else 0.0
+        sensor.read()
+        q_cur = body.get_quat().cpu().numpy()
+        pos = body.get_pos().cpu().numpy()
+        vel = body.get_vel().cpu().numpy()
+        omega_world = body.get_ang().cpu().numpy()
+        recorder.record(
+            step * SIM_DT_S, pos, q_cur, vel, omega_world,
+            GimbalState.from_pitch(pitch),
+        )
+        rigid_solver.clear_external_force()
+        T_total, q_des = position_pd(np.array([1.0, 0.0, 1.0]), pos, vel)
+        tau, _ = attitude_pd(q_des, q_cur, omega_world)
+        thrusts, _, _ = mixer(T_total, tau[0], tau[1], tau[2])
+        apply_rotor_forces(rigid_solver, link_idx, np.clip(thrusts, 0.0, None))
+        scene.step()
+    recorder.save(path)
+    print(f"ARGUS_TRAJECTORY_EXPORT_PASS path={path} frames={steps}")
+    return path
+
+
 def run_argus_scan(print_output=True):
     """Deterministic pitch scan: -30° to +30°, 5° steps, 13 beams."""
     reset_body(pos=(0.0, 0.0, 1.0))
@@ -1215,6 +1247,11 @@ def run_3d_stationary_scan():
 
 if __name__ == "__main__":
     import sys
+    if "--export-trajectory" in sys.argv:
+        index = sys.argv.index("--export-trajectory")
+        path = sys.argv[index + 1] if index + 1 < len(sys.argv) else "/workspace/echos_argus_trajectory.npz"
+        run_argus_trajectory_export(path)
+        raise SystemExit(0)
     results = []
     results.append(run_pos_test("X offset 0.5m", init_pos=(0.5, 0.0, 1.0), pos_des=(0.0, 0.0, 1.0)))
     results.append(run_pos_test("Y offset 0.5m", init_pos=(0.0, 0.5, 1.0), pos_des=(0.0, 0.0, 1.0)))

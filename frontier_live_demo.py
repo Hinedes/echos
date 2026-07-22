@@ -462,7 +462,7 @@ def main():
                                             live_callback=on_event,
                                             live_interval=args.render_every)
         state.log("REPLAY ARGUS starting")
-        estimate, truth = replay(trajectory_path, target=SOUND_SOURCE_WORLD)
+        estimate, truth = replay(str(trajectory_path), target=SOUND_SOURCE_WORLD)
         error = float(np.linalg.norm(estimate - truth))
         report = write_artifacts(output_dir, mission, estimate, truth, error,
                                  run_uuid, args.seed, backend, gpu)

@@ -686,8 +686,8 @@ def parse_args():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--viewer", action="store_true")
-    parser.add_argument("--pace", type=float, default=0.08, help="seconds per streamed frame")
-    parser.add_argument("--render-every", type=int, default=5)
+    parser.add_argument("--pace", type=float, default=0.02, help="seconds per streamed frame")
+    parser.add_argument("--render-every", type=int, default=20)
     parser.add_argument("--no-tailscale-serve", action="store_true")
     return parser.parse_args()
 

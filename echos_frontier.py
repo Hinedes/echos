@@ -164,12 +164,22 @@ def run_frontier_exploration(record_path=None):
     recorder = TrajectoryRecorder(physics_dt_s=SIM_DT_S, control_dt_s=SIM_DT_S) if record_path else None
     gimbal_state = GimbalState.from_pitch(0.0)
     sim_t = 0.0
+    last_recorded_t = None
+
+    def record_frame(t_s, pos, quat, vel, omega):
+        nonlocal last_recorded_t
+        if recorder is None:
+            return
+        if last_recorded_t is not None and t_s <= last_recorded_t:
+            t_s = last_recorded_t + SIM_DT_S
+        recorder.record(t_s, pos, quat, vel, omega, gimbal_state)
+        last_recorded_t = t_s
+
     for _ in range(20):
         rs.clear_external_force()
         qc = body.get_quat().cpu().numpy(); p = body.get_pos().cpu().numpy()
         v = body.get_vel().cpu().numpy(); om = body.get_ang().cpu().numpy()
-        if recorder:
-            recorder.record(sim_t, p, qc, v, om, gimbal_state)
+        record_frame(sim_t, p, qc, v, om)
         Tt, qd = position_pd(np.array([0.0, 0.0, 1.0]), p, v)
         tau, _ = attitude_pd(qd, qc, om)
         ts, sat, _, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
@@ -209,8 +219,7 @@ def run_frontier_exploration(record_path=None):
         if is_thr:
             dt = argus_throw.read(); raw_t = dt.distances.flatten()[0].item()
 
-        if recorder:
-            recorder.record(sim_t, pos, q_cur, vel, om, gimbal_state)
+        record_frame(sim_t, pos, q_cur, vel, om)
 
         Rwb = R_world_from_body(q_cur)
         ew = pos + Rwb @ np.array([RAYCAST_ORIGIN, 0.0, 0.0])
@@ -337,8 +346,7 @@ def run_frontier_exploration(record_path=None):
             rs.clear_external_force()
             qc = body.get_quat().cpu().numpy(); p2 = body.get_pos().cpu().numpy()
             v2 = body.get_vel().cpu().numpy(); om2 = body.get_ang().cpu().numpy()
-            if recorder:
-                recorder.record(sim_t, p2, qc, v2, om2, gimbal_state)
+            record_frame(sim_t, p2, qc, v2, om2)
 
             if wp_i_rtl >= len(pth):
                 tgt2 = launch.copy()

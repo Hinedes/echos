@@ -59,6 +59,9 @@ class LiveState:
                           "gpu": gpu, "phase": "IDLE", "step": 0,
                           "sim_time_s": 0.0, "mission_started": False,
                           "paused": False, "control_state": "WAITING_FOR_START",
+                          "position_xyz": [0.0, 0.0, 1.0], "coverage_percent": 0.0,
+                          "min_clearance_m": 0.0, "rtl_distance_m": None,
+                          "selected_frontier": None, "exploration_path": [], "rtl_path": [],
                           "wall_clock_utc": utc_now()}
         self.logs = deque(maxlen=300)
         self.final = None
@@ -165,6 +168,38 @@ class LiveState:
         self.log("ABORT_REQUEST accepted")
         return True
 
+    def reset(self):
+        with self.lock:
+            if self.started and not self.done:
+                return False
+            self.run_uuid = str(uuid.uuid4())
+            self.frame = None
+            self.frame_seq = 0
+            self.telemetry = {
+                "run_uuid": self.run_uuid, "seed": self.seed,
+                "backend": self.backend, "gpu": self.gpu, "phase": "IDLE",
+                "step": 0, "sim_time_s": 0.0, "mission_started": False,
+                "paused": False, "control_state": "WAITING_FOR_START",
+                "position_xyz": [0.0, 0.0, 1.0], "coverage_percent": 0.0,
+                "min_clearance_m": 0.0, "rtl_distance_m": None,
+                "selected_frontier": None, "exploration_path": [], "rtl_path": [],
+                "wall_clock_utc": utc_now(), "camera": self.camera_name,
+            }
+            self.logs.clear()
+            self.final = None
+            self.done = False
+            self.started = False
+            self.paused = False
+            self.abort_requested = False
+            self.lock.notify_all()
+        for name in ("final.json", "frontier_argus_demo.json"):
+            try:
+                (self.output_dir / name).unlink()
+            except FileNotFoundError:
+                pass
+        self.log("RESET_REQUEST accepted")
+        return True
+
     def step_guard(self):
         with self.lock:
             while self.paused and not self.abort_requested:
@@ -226,6 +261,10 @@ class LiveRenderer:
         if len(rtl) > 1:
             self.scene.draw_debug_trajectory(rtl, radius=0.014,
                                              color=(1.0, 0.55, 0.05, 0.95))
+        self.scene.draw_debug_sphere(event["position"], radius=0.15,
+                                     color=(0.1, 1.0, 0.95, 1.0))
+        self.scene.draw_debug_arrow(event["position"], vec=(0.0, 0.0, 0.55),
+                                    radius=0.018, color=(0.1, 1.0, 0.95, 1.0))
         self.scene.draw_debug_sphere((0.0, 0.0, 1.0), radius=0.12,
                                      color=(1.0, 0.7, 0.0, 1.0))
         self.scene.draw_debug_sphere(self.truth, radius=0.11,
@@ -285,6 +324,10 @@ class LiveRenderer:
         self.last_error = error
         self.last_gates = gates
         self.heartbeat = not self.heartbeat
+        if self.state.camera_name == "alternate":
+            pos = np.asarray(event["position"], dtype=float)
+            self.camera.set_pose(pos=pos + np.array([2.2, -2.8, 2.0]),
+                                 lookat=pos, up=(0.0, 0.0, 1.0))
         self._debug_geometry(event, estimate)
         rgb = self.camera.render(rgb=True, force_render=True)[0]
         if hasattr(rgb, "cpu"):
@@ -314,6 +357,8 @@ class LiveRenderer:
             "argus_estimate_position": None if estimate is None else [float(x) for x in estimate],
             "argus_localization_error_m": error,
             "mission_passed": None if gates is None else gates["mission_passed"],
+            "exploration_path": [[float(p[0]), float(p[1])] for p in self._path(event["exploration_path"], 250)],
+            "rtl_path": [[float(p[0]), float(p[1])] for p in self._path(event["rtl_path"], 250)],
         }, output.getvalue())
         if event["phase"] != self.last_phase:
             self.state.log(f"PHASE {event['phase']} step={event['step']}")
@@ -331,12 +376,28 @@ class LiveRenderer:
 
     def toggle_camera(self):
         with self.render_lock:
-            index = 1 if self.state.camera_name == "overhead" else 0
-            pos, lookat = self.camera_poses[index]
-            self.camera.set_pose(pos=pos, lookat=lookat, up=(0.0, 0.0, 1.0))
-            self.state.set_camera("alternate" if index else "overhead")
+            self.state.set_camera("alternate" if self.state.camera_name == "overhead" else "overhead")
+            if self.state.camera_name == "overhead":
+                pos, lookat = self.camera_poses[0]
+                self.camera.set_pose(pos=pos, lookat=lookat, up=(0.0, 0.0, 1.0))
             if self.last_event is not None:
                 self._render(self.last_event, self.last_estimate, self.last_error, self.last_gates)
+
+    def reset_view(self):
+        with self.render_lock:
+            self.state.set_camera("overhead")
+            self.last_event = None
+            self.last_estimate = None
+            self.last_error = None
+            self.last_gates = None
+            self._render({
+                "phase": "IDLE", "step": 0, "sim_time_s": 0.0,
+                "position": np.array([0.0, 0.0, 1.0]), "coverage_percent": 0.0,
+                "collision_count": 0, "min_clearance_m": float("inf"),
+                "unknown_traversal": 0, "frontiers_discovered": 0,
+                "selected_frontier": None, "rtl_distance_m": None,
+                "exploration_path": np.empty((0, 3)), "rtl_path": np.empty((0, 3)),
+            })
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -380,6 +441,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "/control/resume": lambda: self.state.set_paused(False),
             "/control/abort": lambda: self.state.abort(),
             "/control/camera": lambda: (self.renderer.toggle_camera() or True),
+            "/control/reset": lambda: self._reset(),
         }
         action = actions.get(path)
         if action is None:
@@ -390,6 +452,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send(json.dumps({"ok": True, "changed": bool(changed)}), "application/json")
         except Exception as exc:
             self._send(json.dumps({"ok": False, "error": str(exc)}), "application/json", 500)
+
+    def _reset(self):
+        changed = self.state.reset()
+        if changed:
+            self.renderer.reset_view()
+        return changed
 
     def stream(self):
         self.send_response(200)
@@ -431,16 +499,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
 DASHBOARD_HTML = """<!doctype html>
 <html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Genesis Frontier Live Proof</title>
-<style>body{background:#101318;color:#e9edf1;font:14px monospace;margin:16px}main{display:grid;grid-template-columns:minmax(480px,2fr) minmax(300px,1fr);gap:16px}img{width:100%;background:#000;border:1px solid #39414d}pre{white-space:pre-wrap;background:#171c24;padding:12px;overflow:auto;max-height:360px}h1{font-size:20px}button{background:#2b6cff;color:white;border:0;border-radius:4px;padding:9px 13px;margin:3px;font:inherit;cursor:pointer}button:disabled{background:#444;cursor:not-allowed}.control{padding:8px 0}@media(max-width:900px){main{display:block}}</style></head>
+<style>body{background:#0d1117;color:#e9edf1;font:14px monospace;margin:16px}h1{font-size:21px;margin:0 0 8px}.control{padding:8px 0;border-bottom:1px solid #303844}button{background:#2b6cff;color:white;border:0;border-radius:4px;padding:9px 13px;margin:3px;font:inherit;cursor:pointer}button:disabled{background:#444;cursor:not-allowed}.layout{display:grid;grid-template-columns:minmax(620px,2fr) minmax(330px,1fr);gap:14px;margin-top:14px}.viewport,.map{background:#05070a;border:1px solid #39414d;padding:5px}.viewport img{display:block;width:100%;min-height:360px;object-fit:cover}.map canvas{display:block;width:100%;height:320px}.cards{display:grid;grid-template-columns:1fr 1fr;gap:8px}.card{background:#171c24;border-radius:4px;padding:10px}.label{color:#8b98aa;font-size:11px}.value{font-size:18px;margin-top:4px;color:#fff}.pass{color:#7dff98}.fail{color:#ff7777}pre{white-space:pre-wrap;background:#171c24;padding:12px;overflow:auto;max-height:300px}details{margin-top:12px}a{color:#70a7ff}@media(max-width:1000px){.layout{display:block}.map{margin-top:14px}}</style></head>
 <body><h1>Genesis Frontier Live Proof</h1>
-<div class="control"><button id="start">Start mission</button><button id="pause">Pause simulation</button><button id="resume">Resume simulation</button><button id="abort">Abort</button><button id="camera">Move camera</button><span id="action">WAITING FOR START</span></div>
-<main><section><img id="stream" src="/stream.mjpg" alt="live Genesis camera"><h2>Mission Log</h2><pre id="logs">waiting for mission...</pre></section>
-<section><h2>Telemetry</h2><pre id="telemetry">connecting...</pre><h2>Final Gates</h2><pre id="gates">pending...</pre><h2>Artifacts</h2><ul id="artifacts"></ul></section></main>
+<div class="control"><button id="start">Start mission</button><button id="pause">Pause</button><button id="resume">Resume</button><button id="abort">Abort</button><button id="reset">Reset</button><button id="camera">Move camera</button><span id="action">WAITING FOR START</span></div>
+<div class="layout"><section><div class="viewport"><img id="stream" src="/stream.mjpg" alt="live Genesis camera"></div><div class="map"><canvas id="map" width="900" height="500"></canvas></div></section>
+<aside><div class="cards"><div class="card"><div class="label">PHASE</div><div class="value" id="phase">IDLE</div></div><div class="card"><div class="label">SIM STEP</div><div class="value" id="step">0</div></div><div class="card"><div class="label">POSITION XYZ</div><div class="value" id="position">-</div></div><div class="card"><div class="label">FRAME / HEARTBEAT</div><div class="value" id="frame">-</div></div><div class="card"><div class="label">COVERAGE</div><div class="value" id="coverage">-</div></div><div class="card"><div class="label">FRONTIER</div><div class="value" id="frontier">-</div></div><div class="card"><div class="label">CLEARANCE</div><div class="value" id="clearance">-</div></div><div class="card"><div class="label">RTL / ARGUS ERROR</div><div class="value" id="results">-</div></div></div><h2>Final Gates</h2><pre id="gates">pending...</pre><h2>Artifacts</h2><ul id="artifacts"></ul></aside></div>
+<details><summary>Raw telemetry and mission log</summary><pre id="telemetry">connecting...</pre><pre id="logs">waiting for mission...</pre></details>
 <script>
 (function () {
   var names = ['final.json','frontier_argus_demo.json','frontier_trajectory.npz','frontier_maps.npz','occupancy_map.pgm','sound_heatmap.pgm','frontier_argus_demo.svg','mission.log'];
-  var ids = {telemetry: document.getElementById('telemetry'), logs: document.getElementById('logs'), gates: document.getElementById('gates'), action: document.getElementById('action')};
-  var buttons = {start: document.getElementById('start'), pause: document.getElementById('pause'), resume: document.getElementById('resume'), abort: document.getElementById('abort'), camera: document.getElementById('camera')};
+  var ids = {telemetry: document.getElementById('telemetry'), logs: document.getElementById('logs'), gates: document.getElementById('gates'), action: document.getElementById('action'), phase: document.getElementById('phase'), step: document.getElementById('step'), position: document.getElementById('position'), frame: document.getElementById('frame'), coverage: document.getElementById('coverage'), frontier: document.getElementById('frontier'), clearance: document.getElementById('clearance'), results: document.getElementById('results')};
+  var buttons = {start: document.getElementById('start'), pause: document.getElementById('pause'), resume: document.getElementById('resume'), abort: document.getElementById('abort'), reset: document.getElementById('reset'), camera: document.getElementById('camera')};
+  var canvas = document.getElementById('map');
+  var ctx = canvas.getContext('2d');
   document.getElementById('artifacts').innerHTML = names.map(function (n) { return '<li><a href="/artifacts/' + n + '">' + n + '</a></li>'; }).join('');
   function control(path) {
     fetch(path, {method: 'POST', cache: 'no-store'}).then(function () { poll(); }).catch(function (e) { ids.action.textContent = String(e); });
@@ -449,17 +520,41 @@ DASHBOARD_HTML = """<!doctype html>
   buttons.pause.onclick = function () { control('/control/pause'); };
   buttons.resume.onclick = function () { control('/control/resume'); };
   buttons.abort.onclick = function () { control('/control/abort'); };
+  buttons.reset.onclick = function () { control('/control/reset'); };
   buttons.camera.onclick = function () { control('/control/camera'); };
+  function mapPoint(p) { return [30 + (p[0] + 2) * (canvas.width - 60) / 9, canvas.height - 25 - (p[1] + 2) * (canvas.height - 50) / 7]; }
+  function drawMap(s) {
+    ctx.fillStyle = '#101820'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = '#263746'; ctx.lineWidth = 1;
+    for (var gx = -2; gx <= 7; gx += 1) { var a = mapPoint([gx, -2]); var b = mapPoint([gx, 5]); ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke(); }
+    for (var gy = -2; gy <= 5; gy += 1) { var c = mapPoint([-2, gy]); var d = mapPoint([7, gy]); ctx.beginPath(); ctx.moveTo(c[0], c[1]); ctx.lineTo(d[0], d[1]); ctx.stroke(); }
+    function path(points, color, width) { if (!points || points.length < 2) return; ctx.strokeStyle = color; ctx.lineWidth = width; ctx.beginPath(); points.forEach(function (p, i) { var q = mapPoint(p); if (i) ctx.lineTo(q[0], q[1]); else ctx.moveTo(q[0], q[1]); }); ctx.stroke(); }
+    path(s.exploration_path, '#2cff72', 4); path(s.rtl_path, '#ff9f1c', 4);
+    function dot(point, color, radius) { var q = mapPoint(point); ctx.fillStyle = color; ctx.beginPath(); ctx.arc(q[0], q[1], radius, 0, Math.PI * 2); ctx.fill(); }
+    dot([0, 0], '#ffc400', 8); dot([2.4, 0], '#4a8cff', 8); dot([s.position_xyz[0], s.position_xyz[1]], '#16f0e5', 10);
+    if (s.selected_frontier) dot([s.selected_frontier.x, s.selected_frontier.y], '#ff35d0', 9);
+    ctx.fillStyle = '#e9edf1'; ctx.font = '16px monospace'; ctx.fillText('LIVE FLIGHT MAP  green=explore  orange=RTL  cyan=drone', 16, 24);
+  }
   function poll() {
     fetch('/status.json?ts=' + Date.now(), {cache: 'no-store'}).then(function (response) { return response.json(); }).then(function (s) {
       ids.telemetry.textContent = JSON.stringify(s, null, 2);
       ids.logs.textContent = (s.logs || []).join(String.fromCharCode(10));
       ids.logs.scrollTop = ids.logs.scrollHeight;
       ids.action.textContent = s.control_state || s.phase;
+      ids.phase.textContent = s.phase + (s.paused ? ' / PAUSED' : '');
+      ids.step.textContent = String(s.step);
+      ids.position.textContent = s.position_xyz.map(function (v) { return Number(v).toFixed(2); }).join(', ');
+      ids.frame.textContent = String(s.frame_seq) + ' / ' + (s.frame_seq % 2 ? '|' : '/');
+      ids.coverage.textContent = Number(s.coverage_percent).toFixed(1) + '%';
+      ids.frontier.textContent = s.selected_frontier ? Number(s.selected_frontier.x).toFixed(2) + ', ' + Number(s.selected_frontier.y).toFixed(2) : 'none';
+      ids.clearance.textContent = Number(s.min_clearance_m).toFixed(3) + ' m';
+      ids.results.textContent = (s.rtl_distance_m == null ? '-' : Number(s.rtl_distance_m).toFixed(3) + ' m') + ' / ' + (s.argus_localization_error_m == null ? '-' : Number(s.argus_localization_error_m).toFixed(3) + ' m');
+      drawMap(s);
       buttons.start.disabled = s.mission_started || s.final_available;
       buttons.pause.disabled = !s.mission_started || s.paused || s.final_available;
       buttons.resume.disabled = !s.mission_started || !s.paused || s.final_available;
       buttons.abort.disabled = !s.mission_started || s.final_available;
+      buttons.reset.disabled = s.mission_started && !s.final_available;
       if (s.final_available) {
         fetch('/final.json?ts=' + Date.now(), {cache: 'no-store'}).then(function (response) { return response.json(); }).then(function (f) {
           ids.gates.textContent = JSON.stringify(f.acceptance_gates || f, null, 2);
@@ -631,7 +726,7 @@ def main():
         estimate, truth = replay(str(trajectory_path), target=SOUND_SOURCE_WORLD)
         error = float(np.linalg.norm(estimate - truth))
         report = write_artifacts(output_dir, mission, estimate, truth, error,
-                                 run_uuid, args.seed, backend, gpu)
+                                 state.run_uuid, args.seed, backend, gpu)
         final_event = {
             "phase": "COMPLETE", "step": mission["term_step"] + 21 + len(mission["rtl_trajectory"]),
             "sim_time_s": float(renderer.state.telemetry.get("sim_time_s", 0.0)),
@@ -652,7 +747,7 @@ def main():
             return
         state.log("SERVER_RETAINED final dashboard is available until process exit")
       except MissionAborted:
-        report = {"run_uuid": run_uuid, "seed": args.seed, "backend": backend,
+        report = {"run_uuid": state.run_uuid, "seed": args.seed, "backend": backend,
                   "gpu": gpu, "aborted": True, "mission_passed": False,
                   "acceptance_gates": {}}
         state.finish(report)

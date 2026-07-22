@@ -96,6 +96,7 @@ class LiveState:
             self.telemetry["backend"] = self.backend
             self.telemetry["gpu"] = self.gpu
             self.telemetry["wall_clock_utc"] = utc_now()
+            self.telemetry["mission_started"] = self.started
             self.telemetry["paused"] = self.paused
             self.telemetry["control_state"] = "PAUSED" if self.paused else self.telemetry.get("phase", "IDLE")
             self.telemetry["camera"] = self.camera_name

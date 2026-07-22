@@ -486,6 +486,9 @@ def main():
         state.log(f"FINAL_JSON {output_dir / 'final.json'}")
         if not report["mission_passed"]:
             raise SystemExit(1)
+        state.log("SERVER_RETAINED final dashboard is available until process exit")
+        while True:
+            time.sleep(1.0)
     except Exception as exc:
         state.log(f"FAIL {type(exc).__name__}: {exc}")
         raise

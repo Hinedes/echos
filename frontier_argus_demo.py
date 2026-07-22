@@ -99,6 +99,10 @@ def run(output_dir):
         "min_clearance_m": mission["min_clearance"],
         "unknown_traversal": mission["unknown_traversal"],
         "frontier_oscillation": mission["oscillation"],
+        "frontier_centers": [
+            [float(frontier["cx"]), float(frontier["cy"])]
+            for frontier in mission["frontiers"]
+        ],
         "rtl_distance_m": float(mission["rtl_dist"]),
         "source_truth_world_m": truth.tolist(),
         "source_estimate_world_m": estimate.tolist(),

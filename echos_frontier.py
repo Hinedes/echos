@@ -100,7 +100,8 @@ def select_frontier(occ, inf, cs, cur_pos, mapper):
         ccx = sum(c[0] for c in cells) / len(cells)
         ccy = sum(c[1] for c in cells) / len(cells)
         cx_r, cy_r = round(ccx), round(ccy)
-        if (cx_r, cy_r) in completed_frontiers:
+        if any(abs(cx_r - done_x) <= 3 and abs(cy_r - done_y) <= 3
+               for done_x, done_y in completed_frontiers):
             continue
         if ((cx_r, cy_r), map_revision) in failed_frontiers:
             continue

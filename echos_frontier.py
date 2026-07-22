@@ -1,11 +1,13 @@
 """Autonomous frontier exploration — shared core with echos_core.py."""
 import genesis as gs
 import numpy as np
+import os
 from echos_core import *
 import math
 import hashlib
+from argus_export import GimbalState, TrajectoryRecorder
 
-gs.init(backend=gs.amdgpu)
+gs.init(backend=getattr(gs, os.environ.get("ECHOS_GENESIS_BACKEND", "gpu")))
 scene = gs.Scene(show_viewer=False, rigid_options=gs.options.RigidOptions(enable_collision=True))
 
 body = scene.add_entity(gs.morphs.Box(size=(BODY_W, BODY_D, BODY_H), pos=(0, 0, 1), fixed=False))
@@ -30,6 +32,7 @@ scene.build()
 body.set_mass(MASS)
 rs = scene.sim.rigid_solver
 li = 0
+SIM_DT_S = 0.01
 
 
 def frontier_clusters(occ, inf):
@@ -141,7 +144,7 @@ def select_frontier(occ, inf, cs, cur_pos, mapper):
     return best, cur_path
 
 
-def run_frontier_exploration():
+def run_frontier_exploration(record_path=None):
     print("\n" + "="*50)
     print("  Autonomous Frontier Exploration")
     print("="*50)
@@ -149,15 +152,21 @@ def run_frontier_exploration():
     clear_failed_frontiers()
 
     reset_body_state(body, rs, pos=(0.0, 0.0, 1.0))
+    recorder = TrajectoryRecorder(physics_dt_s=SIM_DT_S, control_dt_s=SIM_DT_S) if record_path else None
+    gimbal_state = GimbalState.from_pitch(0.0)
+    sim_t = 0.0
     for _ in range(20):
         rs.clear_external_force()
         qc = body.get_quat().cpu().numpy(); p = body.get_pos().cpu().numpy()
         v = body.get_vel().cpu().numpy(); om = body.get_ang().cpu().numpy()
+        if recorder:
+            recorder.record(sim_t, p, qc, v, om, gimbal_state)
         Tt, qd = position_pd(np.array([0.0, 0.0, 1.0]), p, v)
         tau, _ = attitude_pd(qd, qc, om)
         ts, sat, _, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
         apply_rotor_forces(rs, li, ts)
         scene.step()
+        sim_t += SIM_DT_S
 
     mx, mxx, my, myy = -2.0, 7.0, -2.0, 5.0
     mapper = OccupancyMapper((mx, mxx, my, myy), 0.08)
@@ -190,6 +199,9 @@ def run_frontier_exploration():
         is_thr = (step % 5 == 0)
         if is_thr:
             dt = argus_throw.read(); raw_t = dt.distances.flatten()[0].item()
+
+        if recorder:
+            recorder.record(sim_t, pos, q_cur, vel, om, gimbal_state)
 
         Rwb = R_world_from_body(q_cur)
         ew = pos + Rwb @ np.array([RAYCAST_ORIGIN, 0.0, 0.0])
@@ -284,6 +296,7 @@ def run_frontier_exploration():
         ts, sat, _, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
         apply_rotor_forces(rs, li, ts)
         scene.step()
+        sim_t += SIM_DT_S
         pos = body.get_pos().cpu().numpy()
         if check_collision(body): collided = True
         traj.append(pos.copy()); scan_log.append((step, raw_f.copy(), active_state))
@@ -310,6 +323,8 @@ def run_frontier_exploration():
             rs.clear_external_force()
             qc = body.get_quat().cpu().numpy(); p2 = body.get_pos().cpu().numpy()
             v2 = body.get_vel().cpu().numpy(); om2 = body.get_ang().cpu().numpy()
+            if recorder:
+                recorder.record(sim_t, p2, qc, v2, om2, gimbal_state)
 
             if wp_i_rtl >= len(pth):
                 tgt2 = launch.copy()
@@ -327,6 +342,7 @@ def run_frontier_exploration():
             ts, sat, _, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
             apply_rotor_forces(rs, li, ts)
             scene.step()
+            sim_t += SIM_DT_S
             if check_collision(body): collided = True
             df2 = argus_flood.read(); raw_f2 = df2.distances.cpu().numpy().flatten()
             vf2 = raw_f2[raw_f2 >= 0]
@@ -400,6 +416,10 @@ def run_frontier_exploration():
     print(f"  RTL dist: {rtl_d:.4f}, collision: {collided}")
     print(f"  Min clearance: {min_clr:.4f}")
 
+    if recorder:
+        recorder.save(record_path)
+        print(f"  Trajectory export: {record_path}")
+
     print("\n" + "="*50)
     print("  Pass Criteria")
     print("="*50)
@@ -435,6 +455,16 @@ def run_frontier_exploration():
         "occ_grid_hash": occ_grid_hash,
         "term_step": step,
         "rtl_dist": rtl_d,
+        "coverage_percent": float(er),
+        "mapper": mapper,
+        "trajectory": np.asarray(traj),
+        "rtl_trajectory": np.asarray(traj_rtl),
+        "frontiers": front_log,
+        "min_clearance": float(min_clr),
+        "collision": bool(collided),
+        "unknown_traversal": int(unknown_at_step),
+        "oscillation": bool(oscillation),
+        "terminated_no_frontier": "NO_FRONTIER" in [d[1] for d in dec],
     }
 
 if __name__ == "__main__":

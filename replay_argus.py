@@ -17,11 +17,13 @@ from argus.solve import solve_point
 from argus.synthesize import synthesize
 
 
-def replay(path, speed=343.0):
+def replay(path, speed=343.0, target=None):
     trajectory = SampledTrajectory(path, strict_contract=True)
     schedule = build_schedule([40_000, 42_000, 44_000, 46_000, 48_000], 0.004, 250_000)
-    origin0 = trajectory.emitter_pos(0.0)
-    target = origin0 + trajectory.beam_axis(0.0) * 2.5
+    if target is None:
+        origin0 = trajectory.emitter_pos(0.0)
+        target = origin0 + trajectory.beam_axis(0.0) * 2.5
+    target = np.asarray(target, dtype=float)
     waveforms = synthesize(
         schedule, [Reflector(target)], ECHOS_MIC_OFFSETS, speed,
         coherent=True, trajectory=trajectory,

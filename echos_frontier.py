@@ -123,6 +123,10 @@ def select_frontier(occ, inf, cs, cur_pos, mapper):
             d = abs(ix - uc_x) + abs(iy - uc_y)
             if d < best_d: best_d = d; gx, gy = ix, iy
 
+        candidate_x, candidate_y = mapper.g2w(gx, gy)
+        if not (-0.4 <= candidate_x <= 6.0 and -1.4 <= candidate_y <= 3.9):
+            continue
+
         pth = astar_path(inf, (sx, sy), (gx, gy))
         if pth is None: continue
 

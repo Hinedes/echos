@@ -8,7 +8,8 @@ import hashlib
 from argus_export import GimbalState, TrajectoryRecorder
 
 gs.init(backend=getattr(gs, os.environ.get("ECHOS_GENESIS_BACKEND", "gpu")))
-scene = gs.Scene(show_viewer=False, rigid_options=gs.options.RigidOptions(enable_collision=True))
+SHOW_VIEWER = os.environ.get("ECHOS_SHOW_VIEWER") == "1"
+scene = gs.Scene(show_viewer=SHOW_VIEWER, rigid_options=gs.options.RigidOptions(enable_collision=True))
 
 body = scene.add_entity(gs.morphs.Box(size=(BODY_W, BODY_D, BODY_H), pos=(0, 0, 1), fixed=False))
 scene.add_entity(gs.morphs.Box(size=(7.0, 0.01, 2.0), pos=(2.75, -1.5, 1.0), fixed=True))
@@ -18,6 +19,10 @@ scene.add_entity(gs.morphs.Box(size=(0.01, 3.0, 2.0), pos=(3.0, 2.75, 1.0), fixe
 scene.add_entity(gs.morphs.Box(size=(3.5, 0.01, 2.0), pos=(4.75, 4.0, 1.0), fixed=True))
 scene.add_entity(gs.morphs.Box(size=(0.5, 0.8, 1.5), pos=(1.5, 1.0, 0.75), fixed=True))
 scene.add_entity(gs.morphs.Plane())
+live_camera = scene.add_camera(
+    res=(960, 540), pos=(3.0, -7.5, 8.5), lookat=(2.7, 1.0, 0.0),
+    fov=52, near=0.1, far=20.0, GUI=SHOW_VIEWER, spp=16,
+)
 
 argus_flood = scene.add_sensor(gs.sensors.Raycaster(
     pattern=gs.sensors.SphericalPattern(fov=(60.0, 0.0), n_points=(7, 1)),
@@ -153,7 +158,35 @@ def select_frontier(occ, inf, cs, cur_pos, mapper):
     return best, cur_path
 
 
-def run_frontier_exploration(record_path=None):
+def reachable_coverage(mapper, launch):
+    """Return the existing acceptance coverage calculation for telemetry."""
+    occ = mapper.get_map()
+    sx_f, sy_f = mapper.w2g(launch[0], launch[1])
+    reachable = set()
+    q = [(sx_f, sy_f)]
+    while q:
+        cx, cy = q.pop()
+        if (cx, cy) in reachable or not mapper.in_b(cx, cy) or occ[cy, cx] == 1.0:
+            continue
+        wx_f, wy_f = mapper.g2w(cx, cy)
+        if (-0.75 <= wx_f <= 6.25 and -1.505 <= wy_f <= -1.495) or \
+           (-0.505 <= wx_f <= -0.495 and -2.0 <= wy_f <= 4.0) or \
+           (-0.5 <= wx_f <= 3.0 and 1.495 <= wy_f <= 1.505) or \
+           (2.92 <= wx_f <= 3.08 and 1.25 <= wy_f <= 4.25) or \
+           (3.0 <= wx_f <= 6.5 and 3.995 <= wy_f <= 4.005) or \
+           (1.25 <= wx_f <= 1.75 and 0.6 <= wy_f <= 1.4):
+            continue
+        if occ[cy, cx] != 0.5:
+            continue
+        reachable.add((cx, cy))
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            q.append((cx + dx, cy + dy))
+    seen = mapper.views > 0
+    covered = sum(1 for ix, iy in reachable if seen[iy, ix] and occ[iy, ix] == 0.5)
+    return reachable, (covered / len(reachable) * 100 if reachable else 0.0)
+
+
+def run_frontier_exploration(record_path=None, live_callback=None, live_interval=5):
     print("\n" + "="*50)
     print("  Autonomous Frontier Exploration")
     print("="*50)
@@ -165,6 +198,38 @@ def run_frontier_exploration(record_path=None):
     gimbal_state = GimbalState.from_pitch(0.0)
     sim_t = 0.0
     last_recorded_t = None
+    mapper = None
+    launch = np.array([0.0, 0.0, 1.0])
+    best = None
+    front_log = []
+    traj = []
+    traj_rtl = []
+    min_clr = float('inf')
+    collided = False
+    collision_count = 0
+    unknown_at_step = 0
+
+    def notify(phase, step, pos, rtl_dist=None, force=False):
+        if live_callback is None or (not force and step % live_interval != 0):
+            return
+        coverage = 0.0 if mapper is None else reachable_coverage(mapper, launch)[1]
+        live_callback({
+            "phase": phase,
+            "step": int(step),
+            "sim_time_s": float(sim_t),
+            "position": np.asarray(pos, dtype=float).copy(),
+            "coverage_percent": float(coverage),
+            "collision_count": int(collision_count),
+            "min_clearance_m": float(min_clr),
+            "unknown_traversal": int(unknown_at_step),
+            "frontiers_discovered": len(front_log),
+            "selected_frontier": None if best is None else {
+                "x": float(best["cx"]), "y": float(best["cy"]),
+            },
+            "rtl_distance_m": None if rtl_dist is None else float(rtl_dist),
+            "exploration_path": np.asarray(traj, dtype=float).copy(),
+            "rtl_path": np.asarray(traj_rtl, dtype=float).copy(),
+        })
 
     def record_frame(t_s, pos, quat, vel, omega):
         nonlocal last_recorded_t
@@ -175,7 +240,7 @@ def run_frontier_exploration(record_path=None):
         recorder.record(t_s, pos, quat, vel, omega, gimbal_state)
         last_recorded_t = t_s
 
-    for _ in range(20):
+    for i in range(20):
         rs.clear_external_force()
         qc = body.get_quat().cpu().numpy(); p = body.get_pos().cpu().numpy()
         v = body.get_vel().cpu().numpy(); om = body.get_ang().cpu().numpy()
@@ -186,20 +251,17 @@ def run_frontier_exploration(record_path=None):
         apply_rotor_forces(rs, li, ts)
         scene.step()
         sim_t += SIM_DT_S
+        notify("BOOTSTRAP", i, body.get_pos().cpu().numpy())
 
     mx, mxx, my, myy = -2.0, 7.0, -2.0, 5.0
     mapper = OccupancyMapper((mx, mxx, my, myy), 0.08)
     az_deg = np.linspace(-30, 30, 7)
-    launch = np.array([0.0, 0.0, 1.0])
     bootstrap_tgt = bootstrap_target(launch)
     max_steps = 30000; replan_iv = 120
 
     state = "INITIAL_FLY"
     cur_path = []; wp_i = 0
-    traj = []; scan_log = []; front_log = []; dec = []
-    min_clr = float('inf'); collided = False
-    best = None
-    unknown_at_step = 0
+    scan_log = []; dec = []
 
     # Persistent yaw command (slew-limited across all states)
     yaw_cmd = 0.0
@@ -251,6 +313,7 @@ def run_frontier_exploration(record_path=None):
             if best is None:
                 dec.append((step, "NO_FRONTIER", pos[0], pos[1]))
                 print(f"  step {step}: no reachable frontier -> RTL")
+                notify("NO_FRONTIER", 20 + step, pos, force=True)
                 break
             else:
                 state = "FLY_TO_FRONTIER"; wp_i = 0; state_changed = True
@@ -320,11 +383,15 @@ def run_frontier_exploration(record_path=None):
         sim_t += SIM_DT_S
         pos = body.get_pos().cpu().numpy()
         mapper.mark_free_cell(pos[0], pos[1])
-        if check_collision(body): collided = True
+        if check_collision(body):
+            collided = True
+            collision_count += 1
         traj.append(pos.copy()); scan_log.append((step, raw_f.copy(), active_state))
         pix_at, piy_at = mapper.w2g(pos[0], pos[1])
         if mapper.in_b(pix_at, piy_at) and mapper.views[piy_at, pix_at] == 0:
             unknown_at_step += 1
+        notify("BOOTSTRAP" if step < 300 else "EXPLORE", 20 + step, pos,
+               force=state_changed)
 
     # --- RTL ---
     occ = mapper.get_map()
@@ -365,7 +432,9 @@ def run_frontier_exploration(record_path=None):
             apply_rotor_forces(rs, li, ts)
             scene.step()
             sim_t += SIM_DT_S
-            if check_collision(body): collided = True
+            if check_collision(body):
+                collided = True
+                collision_count += 1
             df2 = argus_flood.read(); raw_f2 = df2.distances.cpu().numpy().flatten()
             vf2 = raw_f2[raw_f2 >= 0]
             if len(vf2) > 0: min_clr = min(min_clr, np.min(vf2))
@@ -373,6 +442,8 @@ def run_frontier_exploration(record_path=None):
             v2 = body.get_vel().cpu().numpy()
             mapper.mark_free_cell(p2[0], p2[1])
             traj_rtl.append(p2.copy())
+            notify("RTL", 20 + step + 1 + s2, p2,
+                   rtl_dist=np.linalg.norm(p2[:2] - launch[:2]), force=s2 == 0)
             if np.linalg.norm(p2[:2] - launch[:2]) < 0.04 and np.linalg.norm(v2[:2]) < 0.1 and s2 > 50:
                 break
 
@@ -380,35 +451,7 @@ def run_frontier_exploration(record_path=None):
     rtl_d = np.linalg.norm(fpos[:2] - launch[:2])
     occ = mapper.get_map(); seen = mapper.views > 0
 
-    # BFS flood fill for reachable free space
-    sx_f, sy_f = mapper.w2g(launch[0], launch[1])
-    reachable = set()
-    q = [(sx_f, sy_f)]
-    while q:
-        cx, cy = q.pop()
-        if (cx, cy) in reachable:
-            continue
-        if not mapper.in_b(cx, cy):
-            continue
-        if occ[cy, cx] == 1.0:
-            continue
-        wx_f, wy_f = mapper.g2w(cx, cy)
-        if (-0.75 <= wx_f <= 6.25 and -1.505 <= wy_f <= -1.495) or \
-           (-0.505 <= wx_f <= -0.495 and -2.0 <= wy_f <= 4.0) or \
-           (-0.5 <= wx_f <= 3.0 and 1.495 <= wy_f <= 1.505) or \
-           (2.92 <= wx_f <= 3.08 and 1.25 <= wy_f <= 4.25) or \
-           (3.0 <= wx_f <= 6.5 and 3.995 <= wy_f <= 4.005) or \
-           (1.25 <= wx_f <= 1.75 and 0.6 <= wy_f <= 1.4):
-            continue
-        if occ[cy, cx] != 0.5:
-            continue
-        reachable.add((cx, cy))
-        for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
-            q.append((cx+dx, cy+dy))
-    tr = len(reachable)
-    te = sum(1 for (ix, iy) in reachable
-             if seen[iy, ix] and occ[iy, ix] == 0.5)
-    er = te / tr * 100 if tr > 0 else 0
+    reachable, er = reachable_coverage(mapper, launch)
 
     # Count legs with at least 3 free cells observed
     horiz_leg_cells = [(ix, iy) for (ix, iy) in reachable
@@ -485,6 +528,7 @@ def run_frontier_exploration(record_path=None):
         "frontiers": front_log,
         "min_clearance": float(min_clr),
         "collision": bool(collided),
+        "collision_count": int(collision_count),
         "unknown_traversal": int(unknown_at_step),
         "oscillation": bool(oscillation),
         "terminated_no_frontier": "NO_FRONTIER" in [d[1] for d in dec],

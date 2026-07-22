@@ -33,6 +33,18 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+def json_text(value):
+    def clean(item):
+        if isinstance(item, dict):
+            return {key: clean(child) for key, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [clean(child) for child in item]
+        if isinstance(item, float) and not np.isfinite(item):
+            return None
+        return item
+    return json.dumps(clean(value), allow_nan=False)
+
+
 def gpu_name():
     try:
         result = subprocess.run(
@@ -61,7 +73,7 @@ class LiveState:
                           "sim_time_s": 0.0, "mission_started": False,
                           "paused": False, "control_state": "WAITING_FOR_START",
                           "position_xyz": [0.0, 0.0, 1.0], "coverage_percent": 0.0,
-                          "physical_clearance_m": 0.0, "sensor_range_m": 0.0,
+                          "physical_clearance_m": None, "sensor_range_m": None,
                           "active_contact_count": 0, "contact_count": 0,
                           "last_contact": None, "safety_stop_active": False,
                           "rtl_distance_m": None,
@@ -176,7 +188,14 @@ class LiveState:
     def reset(self):
         with self.lock:
             if self.started and not self.done:
-                return False
+                self.abort_requested = True
+                self.paused = False
+                self.lock.notify_all()
+                deadline = time.monotonic() + 5.0
+                while not self.done and time.monotonic() < deadline:
+                    self.lock.wait(timeout=0.1)
+                if not self.done:
+                    return False
             self.run_uuid = str(uuid.uuid4())
             self.frame = None
             self.frame_seq = 0
@@ -186,7 +205,7 @@ class LiveState:
                 "step": 0, "sim_time_s": 0.0, "mission_started": False,
                 "paused": False, "control_state": "WAITING_FOR_START",
                 "position_xyz": [0.0, 0.0, 1.0], "coverage_percent": 0.0,
-                "physical_clearance_m": 0.0, "sensor_range_m": 0.0,
+                "physical_clearance_m": None, "sensor_range_m": None,
                 "active_contact_count": 0, "contact_count": 0,
                 "last_contact": None, "safety_stop_active": False,
                 "rtl_distance_m": None,
@@ -229,13 +248,21 @@ class LiveState:
 class LiveRenderer:
     def __init__(self, state, truth, pace_s):
         from PIL import Image, ImageDraw, ImageFont
-        from echos_frontier import live_camera, scene
+        from echos_frontier import (
+            body, live_camera, physical_body_clearance, physical_contacts,
+            reset_body_state, rs, scene,
+        )
 
         self.state = state
         self.truth = np.asarray(truth, dtype=float)
         self.pace_s = pace_s
         self.camera = live_camera
         self.scene = scene
+        self.body = body
+        self.rs = rs
+        self.reset_body_state = reset_body_state
+        self.physical_body_clearance = physical_body_clearance
+        self.physical_contacts = physical_contacts
         self.Image = Image
         self.ImageDraw = ImageDraw
         self.font = ImageFont.load_default()
@@ -306,7 +333,8 @@ class LiveRenderer:
                             "(%.2f, %.2f)" % (event["selected_frontier"]["x"],
                                                event["selected_frontier"]["y"])),
             f"COVERAGE {event['coverage_percent']:.1f}%  COLLISIONS {event['collision_count']}",
-            f"PHYS {event['physical_clearance_m']:.3f}m  SENSOR {event['sensor_range_m']:.3f}m",
+            "PHYS " + ("--" if event["physical_clearance_m"] is None or not np.isfinite(event["physical_clearance_m"]) else f"{event['physical_clearance_m']:.3f}m") +
+            "  SENSOR " + ("--" if event["sensor_range_m"] is None or not np.isfinite(event["sensor_range_m"]) else f"{event['sensor_range_m']:.3f}m"),
             f"CONTACTS {event['active_contact_count']} / TOTAL {event['contact_count']}  UNKNOWN {event['unknown_traversal']}",
             f"SAFETY_STOP {event['safety_stop_active']}",
             f"FRONTIERS {event['frontiers_discovered']}  RTL " +
@@ -409,6 +437,12 @@ class LiveRenderer:
 
     def reset_view(self):
         with self.render_lock:
+            self.reset_body_state(self.body, self.rs, pos=(0.0, 0.0, 1.0))
+            self.scene.step()
+            contacts = self.physical_contacts()
+            self.reset_body_state(self.body, self.rs, pos=(0.0, 0.0, 1.0))
+            clearance, _ = self.physical_body_clearance(
+                self.body.get_pos().cpu().numpy(), self.body.get_quat().cpu().numpy())
             self.state.set_camera("overhead")
             self.last_event = None
             self.last_estimate = None
@@ -417,9 +451,11 @@ class LiveRenderer:
             self._render({
                 "phase": "IDLE", "step": 0, "sim_time_s": 0.0,
                 "position": np.array([0.0, 0.0, 1.0]), "coverage_percent": 0.0,
-                "collision_count": 0, "physical_clearance_m": float("inf"),
-                "sensor_range_m": float("inf"), "active_contact_count": 0,
-                "contact_count": 0, "last_contact": None, "safety_stop_active": False,
+                "collision_count": 0, "physical_clearance_m": clearance,
+                "sensor_range_m": None, "active_contact_count": 0,
+                "contact_count": len(contacts),
+                "last_contact": contacts[-1] if contacts else None,
+                "contacts": contacts, "safety_stop_active": False,
                 "unknown_traversal": 0, "frontiers_discovered": 0,
                 "selected_frontier": None, "rtl_distance_m": None,
                 "exploration_path": np.empty((0, 3)), "rtl_path": np.empty((0, 3)),
@@ -438,6 +474,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -446,12 +483,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/":
             self._send(DASHBOARD_HTML, "text/html; charset=utf-8")
         elif path == "/status.json":
-            self._send(json.dumps(self.state.snapshot()), "application/json")
+            self._send(json_text(self.state.snapshot()), "application/json")
         elif path == "/final.json":
             if self.state.final is None:
                 self._send("final report is not ready\n", "text/plain", 404)
             else:
-                self._send(json.dumps(self.state.final), "application/json")
+                self._send(json_text(self.state.final), "application/json")
         elif path == "/stream.mjpg":
             self.stream()
         elif path.startswith("/artifacts/"):
@@ -471,13 +508,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         }
         action = actions.get(path)
         if action is None:
-            self._send(json.dumps({"ok": False, "error": "not found"}), "application/json", 404)
+            self._send(json_text({"ok": False, "error": "not found"}), "application/json", 404)
             return
         try:
             changed = action()
-            self._send(json.dumps({"ok": True, "changed": bool(changed)}), "application/json")
+            self._send(json_text({"ok": True, "changed": bool(changed)}), "application/json")
         except Exception as exc:
-            self._send(json.dumps({"ok": False, "error": str(exc)}), "application/json", 500)
+            self._send(json_text({"ok": False, "error": str(exc)}), "application/json", 500)
 
     def _reset(self):
         changed = self.state.reset()
@@ -567,7 +604,7 @@ DASHBOARD_HTML = """<!doctype html>
       ids.logs.textContent = (s.logs || []).join(String.fromCharCode(10));
       ids.logs.scrollTop = ids.logs.scrollHeight;
       ids.action.textContent = s.control_state || s.phase;
-      ids.alarm.hidden = !(s.phase === 'CONTACT_FAIL' || Number(s.contact_count || 0) > 0 || Number(s.physical_clearance_m) <= 0.2);
+      ids.alarm.hidden = !(s.phase === 'CONTACT_FAIL' || Number(s.contact_count || 0) > 0 || (s.physical_clearance_m != null && Number(s.physical_clearance_m) <= 0.2));
       ids.alarm.textContent = ids.alarm.hidden ? '' : 'PHYSICAL SAFETY FAILURE: CONTACT / CLEARANCE GATE FAILED';
       ids.phase.textContent = s.phase + (s.paused ? ' / PAUSED' : '');
       ids.step.textContent = String(s.step);
@@ -575,7 +612,7 @@ DASHBOARD_HTML = """<!doctype html>
       ids.frame.textContent = String(s.frame_seq) + ' / ' + (s.frame_seq % 2 ? '|' : '/');
       ids.coverage.textContent = Number(s.coverage_percent).toFixed(1) + '%';
       ids.frontier.textContent = s.selected_frontier ? Number(s.selected_frontier.x).toFixed(2) + ', ' + Number(s.selected_frontier.y).toFixed(2) : 'none';
-      ids.clearance.textContent = Number(s.physical_clearance_m).toFixed(3) + ' m / sensor ' + Number(s.sensor_range_m).toFixed(3) + ' m';
+      ids.clearance.textContent = (s.physical_clearance_m == null ? '-' : Number(s.physical_clearance_m).toFixed(3) + ' m') + ' / sensor ' + (s.sensor_range_m == null ? '-' : Number(s.sensor_range_m).toFixed(3) + ' m');
       ids.results.textContent = (s.rtl_distance_m == null ? '-' : Number(s.rtl_distance_m).toFixed(3) + ' m') + ' / ' + (s.argus_localization_error_m == null ? '-' : Number(s.argus_localization_error_m).toFixed(3) + ' m');
       drawMap(s);
       buttons.start.disabled = s.mission_started || s.final_available;
@@ -727,16 +764,7 @@ def main():
 
     renderer = LiveRenderer(state, SOUND_SOURCE_WORLD, args.pace)
     DashboardHandler.renderer = renderer
-    renderer.render({
-        "phase": "IDLE", "step": 0, "sim_time_s": 0.0,
-        "position": np.array([0.0, 0.0, 1.0]), "coverage_percent": 0.0,
-        "collision_count": 0, "physical_clearance_m": float("inf"),
-        "sensor_range_m": float("inf"), "active_contact_count": 0,
-        "contact_count": 0, "last_contact": None, "safety_stop_active": False,
-        "unknown_traversal": 0, "frontiers_discovered": 0,
-        "selected_frontier": None, "rtl_distance_m": None,
-        "exploration_path": np.empty((0, 3)), "rtl_path": np.empty((0, 3)),
-    })
+    renderer.reset_view()
 
     last_phase = [None]
 

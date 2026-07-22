@@ -1,9 +1,10 @@
 import genesis as gs
 import numpy as np
+import os
 from echos_core import *
 from argus_export import GimbalState, TrajectoryRecorder
 
-gs.init(backend=gs.amdgpu)
+gs.init(backend=getattr(gs, os.environ.get("ECHOS_GENESIS_BACKEND", "gpu")))
 
 scene = gs.Scene(
     show_viewer=False,

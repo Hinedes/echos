@@ -619,7 +619,7 @@ DASHBOARD_HTML = """<!doctype html>
       buttons.pause.disabled = !s.mission_started || s.paused || s.final_available;
       buttons.resume.disabled = !s.mission_started || !s.paused || s.final_available;
       buttons.abort.disabled = !s.mission_started || s.final_available;
-      buttons.reset.disabled = s.mission_started && !s.final_available;
+      buttons.reset.disabled = false;
       if (s.final_available) {
         fetch('/final.json?ts=' + Date.now(), {cache: 'no-store'}).then(function (response) { return response.json(); }).then(function (f) {
           ids.gates.textContent = JSON.stringify(f.acceptance_gates || f, null, 2);

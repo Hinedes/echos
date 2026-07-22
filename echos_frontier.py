@@ -178,7 +178,7 @@ def run_frontier_exploration(record_path=None):
     az_deg = np.linspace(-30, 30, 7)
     launch = np.array([0.0, 0.0, 1.0])
     bootstrap_tgt = bootstrap_target(launch)
-    max_steps = 20000; replan_iv = 120
+    max_steps = 30000; replan_iv = 120
 
     state = "INITIAL_FLY"
     cur_path = []; wp_i = 0

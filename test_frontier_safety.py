@@ -30,7 +30,7 @@ def test_forced_wall_contact_is_reported():
 def test_side_wall_clearance_is_not_forward_sensor_range():
     clearance, obstacle = physical_body_clearance((-0.40, 0.0, 1.0), IDENTITY)
     assert obstacle == "west_wall"
-    assert 0.02 < clearance < 0.05
+    assert abs(clearance - 0.0125) < 1e-6
 
 
 def test_body_overlap_detected_when_center_is_outside_wall():

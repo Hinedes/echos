@@ -272,6 +272,7 @@ def run_frontier_exploration(record_path=None):
                 state = "EXPLORE"; state_changed = True
                 if best is not None:
                     mark_frontier_failed(best["ccx"], best["ccy"], mapper)
+                    completed_frontiers.add((best["ccx"], best["ccy"]))
                 print(f"    ALIGN TIMEOUT at step {step} — abort frontier")
 
         # --- thrust computation (every iteration) ---

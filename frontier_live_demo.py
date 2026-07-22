@@ -25,6 +25,7 @@ ARTIFACTS = (
     "final.json", "frontier_argus_demo.json", "frontier_trajectory.npz",
     "frontier_maps.npz", "occupancy_map.pgm", "sound_heatmap.pgm",
     "frontier_argus_demo.svg", "mission.log",
+    "contact_failure.json", "contact_failure_frame.jpg",
 )
 
 
@@ -60,7 +61,10 @@ class LiveState:
                           "sim_time_s": 0.0, "mission_started": False,
                           "paused": False, "control_state": "WAITING_FOR_START",
                           "position_xyz": [0.0, 0.0, 1.0], "coverage_percent": 0.0,
-                          "min_clearance_m": 0.0, "rtl_distance_m": None,
+                          "physical_clearance_m": 0.0, "sensor_range_m": 0.0,
+                          "active_contact_count": 0, "contact_count": 0,
+                          "last_contact": None, "safety_stop_active": False,
+                          "rtl_distance_m": None,
                           "selected_frontier": None, "exploration_path": [], "rtl_path": [],
                           "wall_clock_utc": utc_now()}
         self.logs = deque(maxlen=300)
@@ -103,7 +107,7 @@ class LiveState:
     def finish(self, report):
         with self.lock:
             self.final = report
-            phase = "ABORTED" if report.get("aborted") else "COMPLETE"
+            phase = "CONTACT_FAIL" if report.get("contact_failure") else "ABORTED" if report.get("aborted") else "COMPLETE"
             self.telemetry.update({
                 "phase": phase,
                 "mission_passed": report["mission_passed"],
@@ -112,7 +116,7 @@ class LiveState:
             })
             self.done = True
             self.lock.notify_all()
-        message = "ABORTED" if report.get("aborted") else "COMPLETE"
+        message = "CONTACT_FAIL" if report.get("contact_failure") else "ABORTED" if report.get("aborted") else "COMPLETE"
         if "localization_error_m" in report:
             message += " mission_passed=%s localization_error_m=%.6f" % (
                 report["mission_passed"], report["localization_error_m"])
@@ -181,7 +185,10 @@ class LiveState:
                 "step": 0, "sim_time_s": 0.0, "mission_started": False,
                 "paused": False, "control_state": "WAITING_FOR_START",
                 "position_xyz": [0.0, 0.0, 1.0], "coverage_percent": 0.0,
-                "min_clearance_m": 0.0, "rtl_distance_m": None,
+                "physical_clearance_m": 0.0, "sensor_range_m": 0.0,
+                "active_contact_count": 0, "contact_count": 0,
+                "last_contact": None, "safety_stop_active": False,
+                "rtl_distance_m": None,
                 "selected_frontier": None, "exploration_path": [], "rtl_path": [],
                 "wall_clock_utc": utc_now(), "camera": self.camera_name,
             }
@@ -298,7 +305,9 @@ class LiveRenderer:
                             "(%.2f, %.2f)" % (event["selected_frontier"]["x"],
                                                event["selected_frontier"]["y"])),
             f"COVERAGE {event['coverage_percent']:.1f}%  COLLISIONS {event['collision_count']}",
-            f"CLEARANCE {event['min_clearance_m']:.3f}m  UNKNOWN {event['unknown_traversal']}",
+            f"PHYS {event['physical_clearance_m']:.3f}m  SENSOR {event['sensor_range_m']:.3f}m",
+            f"CONTACTS {event['active_contact_count']} / TOTAL {event['contact_count']}  UNKNOWN {event['unknown_traversal']}",
+            f"SAFETY_STOP {event['safety_stop_active']}",
             f"FRONTIERS {event['frontiers_discovered']}  RTL " +
             ("--" if event["rtl_distance_m"] is None else f"{event['rtl_distance_m']:.3f}m"),
             "ARGUS TRUTH (%.2f, %.2f, %.2f)" % tuple(self.truth),
@@ -342,6 +351,7 @@ class LiveRenderer:
         from PIL import Image
         output = io.BytesIO()
         Image.fromarray(frame).save(output, format="JPEG", quality=82)
+        jpeg = output.getvalue()
         self.state.publish({
             "phase": event["phase"], "step": event["step"],
             "sim_time_s": event["sim_time_s"],
@@ -349,7 +359,13 @@ class LiveRenderer:
             "selected_frontier": event["selected_frontier"],
             "coverage_percent": event["coverage_percent"],
             "collision_count": event["collision_count"],
-            "min_clearance_m": event["min_clearance_m"],
+            "physical_clearance_m": event["physical_clearance_m"],
+            "sensor_range_m": event["sensor_range_m"],
+            "active_contact_count": event["active_contact_count"],
+            "contact_count": event["contact_count"],
+            "last_contact": event["last_contact"],
+            "contacts": event.get("contacts", []),
+            "safety_stop_active": event["safety_stop_active"],
             "unknown_traversal": event["unknown_traversal"],
             "frontiers_discovered": event["frontiers_discovered"],
             "rtl_distance_m": event["rtl_distance_m"],
@@ -359,7 +375,14 @@ class LiveRenderer:
             "mission_passed": None if gates is None else gates["mission_passed"],
             "exploration_path": [[float(p[0]), float(p[1])] for p in self._path(event["exploration_path"], 250)],
             "rtl_path": [[float(p[0]), float(p[1])] for p in self._path(event["rtl_path"], 250)],
-        }, output.getvalue())
+        }, jpeg)
+        if event["phase"] == "CONTACT_FAIL":
+            (self.state.output_dir / "contact_failure_frame.jpg").write_bytes(jpeg)
+            (self.state.output_dir / "contact_failure.json").write_text(
+                json.dumps({"run_uuid": self.state.run_uuid, "step": event["step"],
+                            "sim_time_s": event["sim_time_s"], "contacts": event.get("contacts", []),
+                            "physical_clearance_m": event["physical_clearance_m"]}, indent=2),
+                encoding="utf-8")
         if event["phase"] != self.last_phase:
             self.state.log(f"PHASE {event['phase']} step={event['step']}")
             self.last_phase = event["phase"]
@@ -393,7 +416,9 @@ class LiveRenderer:
             self._render({
                 "phase": "IDLE", "step": 0, "sim_time_s": 0.0,
                 "position": np.array([0.0, 0.0, 1.0]), "coverage_percent": 0.0,
-                "collision_count": 0, "min_clearance_m": float("inf"),
+                "collision_count": 0, "physical_clearance_m": float("inf"),
+                "sensor_range_m": float("inf"), "active_contact_count": 0,
+                "contact_count": 0, "last_contact": None, "safety_stop_active": False,
                 "unknown_traversal": 0, "frontiers_discovered": 0,
                 "selected_frontier": None, "rtl_distance_m": None,
                 "exploration_path": np.empty((0, 3)), "rtl_path": np.empty((0, 3)),
@@ -499,16 +524,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
 DASHBOARD_HTML = """<!doctype html>
 <html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Genesis Frontier Live Proof</title>
-<style>body{background:#0d1117;color:#e9edf1;font:14px monospace;margin:16px}h1{font-size:21px;margin:0 0 8px}.control{padding:8px 0;border-bottom:1px solid #303844}button{background:#2b6cff;color:white;border:0;border-radius:4px;padding:9px 13px;margin:3px;font:inherit;cursor:pointer}button:disabled{background:#444;cursor:not-allowed}.layout{display:grid;grid-template-columns:minmax(620px,2fr) minmax(330px,1fr);gap:14px;margin-top:14px}.viewport,.map{background:#05070a;border:1px solid #39414d;padding:5px}.viewport img{display:block;width:100%;min-height:360px;object-fit:cover}.map canvas{display:block;width:100%;height:320px}.cards{display:grid;grid-template-columns:1fr 1fr;gap:8px}.card{background:#171c24;border-radius:4px;padding:10px}.label{color:#8b98aa;font-size:11px}.value{font-size:18px;margin-top:4px;color:#fff}.pass{color:#7dff98}.fail{color:#ff7777}pre{white-space:pre-wrap;background:#171c24;padding:12px;overflow:auto;max-height:300px}details{margin-top:12px}a{color:#70a7ff}@media(max-width:1000px){.layout{display:block}.map{margin-top:14px}}</style></head>
+<style>body{background:#0d1117;color:#e9edf1;font:14px monospace;margin:16px}h1{font-size:21px;margin:0 0 8px}.control{padding:8px 0;border-bottom:1px solid #303844}button{background:#2b6cff;color:white;border:0;border-radius:4px;padding:9px 13px;margin:3px;font:inherit;cursor:pointer}button:disabled{background:#444;cursor:not-allowed}.alarm{background:#7f1010;color:#fff;padding:12px;margin-top:10px;font-weight:bold}.layout{display:grid;grid-template-columns:minmax(620px,2fr) minmax(330px,1fr);gap:14px;margin-top:14px}.viewport,.map{background:#05070a;border:1px solid #39414d;padding:5px}.viewport img{display:block;width:100%;min-height:360px;object-fit:cover}.map canvas{display:block;width:100%;height:320px}.cards{display:grid;grid-template-columns:1fr 1fr;gap:8px}.card{background:#171c24;border-radius:4px;padding:10px}.label{color:#8b98aa;font-size:11px}.value{font-size:18px;margin-top:4px;color:#fff}.pass{color:#7dff98}.fail{color:#ff7777}pre{white-space:pre-wrap;background:#171c24;padding:12px;overflow:auto;max-height:300px}details{margin-top:12px}a{color:#70a7ff}@media(max-width:1000px){.layout{display:block}.map{margin-top:14px}}</style></head>
 <body><h1>Genesis Frontier Live Proof</h1>
-<div class="control"><button id="start">Start mission</button><button id="pause">Pause</button><button id="resume">Resume</button><button id="abort">Abort</button><button id="reset">Reset</button><button id="camera">Move camera</button><span id="action">WAITING FOR START</span></div>
+<div class="control"><button id="start">Start mission</button><button id="pause">Pause</button><button id="resume">Resume</button><button id="abort">Abort</button><button id="reset">Reset</button><button id="camera">Move camera</button><span id="action">WAITING FOR START</span></div><div id="alarm" class="alarm" hidden></div>
 <div class="layout"><section><div class="viewport"><img id="stream" src="/stream.mjpg" alt="live Genesis camera"></div><div class="map"><canvas id="map" width="900" height="500"></canvas></div></section>
 <aside><div class="cards"><div class="card"><div class="label">PHASE</div><div class="value" id="phase">IDLE</div></div><div class="card"><div class="label">SIM STEP</div><div class="value" id="step">0</div></div><div class="card"><div class="label">POSITION XYZ</div><div class="value" id="position">-</div></div><div class="card"><div class="label">FRAME / HEARTBEAT</div><div class="value" id="frame">-</div></div><div class="card"><div class="label">COVERAGE</div><div class="value" id="coverage">-</div></div><div class="card"><div class="label">FRONTIER</div><div class="value" id="frontier">-</div></div><div class="card"><div class="label">CLEARANCE</div><div class="value" id="clearance">-</div></div><div class="card"><div class="label">RTL / ARGUS ERROR</div><div class="value" id="results">-</div></div></div><h2>Final Gates</h2><pre id="gates">pending...</pre><h2>Artifacts</h2><ul id="artifacts"></ul></aside></div>
 <details><summary>Raw telemetry and mission log</summary><pre id="telemetry">connecting...</pre><pre id="logs">waiting for mission...</pre></details>
 <script>
 (function () {
   var names = ['final.json','frontier_argus_demo.json','frontier_trajectory.npz','frontier_maps.npz','occupancy_map.pgm','sound_heatmap.pgm','frontier_argus_demo.svg','mission.log'];
-  var ids = {telemetry: document.getElementById('telemetry'), logs: document.getElementById('logs'), gates: document.getElementById('gates'), action: document.getElementById('action'), phase: document.getElementById('phase'), step: document.getElementById('step'), position: document.getElementById('position'), frame: document.getElementById('frame'), coverage: document.getElementById('coverage'), frontier: document.getElementById('frontier'), clearance: document.getElementById('clearance'), results: document.getElementById('results')};
+  var ids = {telemetry: document.getElementById('telemetry'), logs: document.getElementById('logs'), gates: document.getElementById('gates'), action: document.getElementById('action'), alarm: document.getElementById('alarm'), phase: document.getElementById('phase'), position: document.getElementById('position'), step: document.getElementById('step'), frame: document.getElementById('frame'), coverage: document.getElementById('coverage'), frontier: document.getElementById('frontier'), clearance: document.getElementById('clearance'), results: document.getElementById('results')};
   var buttons = {start: document.getElementById('start'), pause: document.getElementById('pause'), resume: document.getElementById('resume'), abort: document.getElementById('abort'), reset: document.getElementById('reset'), camera: document.getElementById('camera')};
   var canvas = document.getElementById('map');
   var ctx = canvas.getContext('2d');
@@ -541,13 +566,15 @@ DASHBOARD_HTML = """<!doctype html>
       ids.logs.textContent = (s.logs || []).join(String.fromCharCode(10));
       ids.logs.scrollTop = ids.logs.scrollHeight;
       ids.action.textContent = s.control_state || s.phase;
+      ids.alarm.hidden = !(s.phase === 'CONTACT_FAIL' || Number(s.contact_count || 0) > 0 || Number(s.physical_clearance_m) <= 0.2);
+      ids.alarm.textContent = ids.alarm.hidden ? '' : 'PHYSICAL SAFETY FAILURE: CONTACT / CLEARANCE GATE FAILED';
       ids.phase.textContent = s.phase + (s.paused ? ' / PAUSED' : '');
       ids.step.textContent = String(s.step);
       ids.position.textContent = s.position_xyz.map(function (v) { return Number(v).toFixed(2); }).join(', ');
       ids.frame.textContent = String(s.frame_seq) + ' / ' + (s.frame_seq % 2 ? '|' : '/');
       ids.coverage.textContent = Number(s.coverage_percent).toFixed(1) + '%';
       ids.frontier.textContent = s.selected_frontier ? Number(s.selected_frontier.x).toFixed(2) + ', ' + Number(s.selected_frontier.y).toFixed(2) : 'none';
-      ids.clearance.textContent = Number(s.min_clearance_m).toFixed(3) + ' m';
+      ids.clearance.textContent = Number(s.physical_clearance_m).toFixed(3) + ' m / sensor ' + Number(s.sensor_range_m).toFixed(3) + ' m';
       ids.results.textContent = (s.rtl_distance_m == null ? '-' : Number(s.rtl_distance_m).toFixed(3) + ' m') + ' / ' + (s.argus_localization_error_m == null ? '-' : Number(s.argus_localization_error_m).toFixed(3) + ' m');
       drawMap(s);
       buttons.start.disabled = s.mission_started || s.final_available;
@@ -634,7 +661,8 @@ def write_artifacts(output_dir, mission, estimate, truth, error, run_uuid, seed,
         "coverage_percent": float(mission["coverage_percent"]),
         "collision": bool(mission["collision"]),
         "collision_count": int(mission["collision_count"]),
-        "min_clearance_m": mission["min_clearance"],
+        "physical_clearance_m": mission["physical_clearance_m"],
+        "sensor_range_m": mission["sensor_range_m"],
         "unknown_traversal": mission["unknown_traversal"],
         "frontier_oscillation": mission["oscillation"],
         "frontier_centers": [[float(f["cx"]), float(f["cy"])] for f in mission["frontiers"]],
@@ -693,7 +721,7 @@ def main():
         else:
             print("Tailnet URL: unavailable; run tailscale serve %d" % args.port, flush=True)
 
-    from echos_frontier import MissionAborted, run_frontier_exploration
+    from echos_frontier import MissionAborted, MissionContactFailure, run_frontier_exploration
     from replay_argus import replay
 
     renderer = LiveRenderer(state, SOUND_SOURCE_WORLD, args.pace)
@@ -701,7 +729,9 @@ def main():
     renderer.render({
         "phase": "IDLE", "step": 0, "sim_time_s": 0.0,
         "position": np.array([0.0, 0.0, 1.0]), "coverage_percent": 0.0,
-        "collision_count": 0, "min_clearance_m": float("inf"),
+        "collision_count": 0, "physical_clearance_m": float("inf"),
+        "sensor_range_m": float("inf"), "active_contact_count": 0,
+        "contact_count": 0, "last_contact": None, "safety_stop_active": False,
         "unknown_traversal": 0, "frontiers_discovered": 0,
         "selected_frontier": None, "rtl_distance_m": None,
         "exploration_path": np.empty((0, 3)), "rtl_path": np.empty((0, 3)),
@@ -733,7 +763,10 @@ def main():
             "position": mission["rtl_trajectory"][-1] if len(mission["rtl_trajectory"]) else np.array([0.0, 0.0, 1.0]),
             "coverage_percent": mission["coverage_percent"],
             "collision_count": mission["collision_count"],
-            "min_clearance_m": mission["min_clearance"],
+            "physical_clearance_m": mission["min_clearance"],
+            "sensor_range_m": mission["sensor_range_m"],
+            "active_contact_count": 0, "contact_count": mission["collision_count"],
+            "last_contact": None, "safety_stop_active": False,
             "unknown_traversal": mission["unknown_traversal"],
             "frontiers_discovered": len(mission["frontiers"]),
             "selected_frontier": None, "rtl_distance_m": mission["rtl_dist"],
@@ -746,6 +779,17 @@ def main():
             state.log("MISSION FAIL final dashboard retained")
             return
         state.log("SERVER_RETAINED final dashboard is available until process exit")
+      except MissionContactFailure as exc:
+        report = {"run_uuid": state.run_uuid, "seed": args.seed, "backend": backend,
+                  "gpu": gpu, "contact_failure": True, "mission_passed": False,
+                  "contact_step": exc.step, "contacts": exc.contacts,
+                  "physical_clearance_m": exc.physical_clearance_m,
+                  "sensor_range_m": state.telemetry.get("sensor_range_m"),
+                  "acceptance_gates": {"no_physical_contact": False,
+                                        "physical_clearance_gt_0_20_m": exc.physical_clearance_m > 0.20}}
+        (output_dir / "final.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        state.finish(report)
+        state.log("CONTACT_FAIL final dashboard retained")
       except MissionAborted:
         report = {"run_uuid": state.run_uuid, "seed": args.seed, "backend": backend,
                   "gpu": gpu, "aborted": True, "mission_passed": False,

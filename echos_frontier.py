@@ -12,13 +12,19 @@ SHOW_VIEWER = os.environ.get("ECHOS_SHOW_VIEWER") == "1"
 scene = gs.Scene(show_viewer=SHOW_VIEWER, rigid_options=gs.options.RigidOptions(enable_collision=True))
 
 body = scene.add_entity(gs.morphs.Box(size=(BODY_W, BODY_D, BODY_H), pos=(0, 0, 1), fixed=False))
-scene.add_entity(gs.morphs.Box(size=(7.0, 0.01, 2.0), pos=(2.75, -1.5, 1.0), fixed=True))
-scene.add_entity(gs.morphs.Box(size=(0.01, 6.0, 2.0), pos=(-0.5, 1.0, 1.0), fixed=True))
-scene.add_entity(gs.morphs.Box(size=(3.5, 0.01, 2.0), pos=(1.25, 1.5, 1.0), fixed=True))
-scene.add_entity(gs.morphs.Box(size=(0.01, 3.0, 2.0), pos=(3.0, 2.75, 1.0), fixed=True))
-scene.add_entity(gs.morphs.Box(size=(3.5, 0.01, 2.0), pos=(4.75, 4.0, 1.0), fixed=True))
-scene.add_entity(gs.morphs.Box(size=(0.5, 0.8, 1.5), pos=(1.5, 1.0, 0.75), fixed=True))
-scene.add_entity(gs.morphs.Plane())
+OBSTACLE_SPECS = (
+    ("south_wall", (2.75, -1.5, 1.0), (7.0, 0.01, 2.0)),
+    ("west_wall", (-0.5, 1.0, 1.0), (0.01, 6.0, 2.0)),
+    ("middle_wall", (1.25, 1.5, 1.0), (3.5, 0.01, 2.0)),
+    ("east_wall", (3.0, 2.75, 1.0), (0.01, 3.0, 2.0)),
+    ("north_wall", (4.75, 4.0, 1.0), (3.5, 0.01, 2.0)),
+    ("block", (1.5, 1.0, 0.75), (0.5, 0.8, 1.5)),
+)
+obstacle_entities = [
+    scene.add_entity(gs.morphs.Box(size=size, pos=pos, fixed=True))
+    for _, pos, size in OBSTACLE_SPECS
+]
+floor_entity = scene.add_entity(gs.morphs.Plane())
 live_camera = scene.add_camera(
     res=(960, 540), pos=(3.0, -7.5, 8.5), lookat=(2.7, 1.0, 0.0),
     fov=52, near=0.1, far=20.0, GUI=SHOW_VIEWER, spp=16,
@@ -38,10 +44,89 @@ body.set_mass(MASS)
 rs = scene.sim.rigid_solver
 li = 0
 SIM_DT_S = 0.01
+BODY_HALF_EXTENTS = np.array([BODY_W, BODY_D, BODY_H], dtype=float) / 2.0
+OBSTACLE_BY_ENTITY = {
+    entity.idx: (name, np.asarray(pos, dtype=float), np.asarray(size, dtype=float) / 2.0)
+    for entity, (name, pos, size) in zip(obstacle_entities, OBSTACLE_SPECS)
+}
+FLOOR_ENTITY_IDX = floor_entity.idx
+BODY_DIAGONAL_M = float(np.linalg.norm(BODY_HALF_EXTENTS[:2]))
+TRACKING_MARGIN_M = 0.18
+BRAKING_SPEED_MPS = 0.50
+BRAKING_ACCEL_MPS2 = float(MAX_HACC)
+BRAKING_MARGIN_M = BRAKING_SPEED_MPS ** 2 / (2.0 * BRAKING_ACCEL_MPS2)
+SAFETY_WARNING_M = BODY_DIAGONAL_M + TRACKING_MARGIN_M + BRAKING_MARGIN_M
+SAFETY_HARD_M = 0.20
 
 
 class MissionAborted(RuntimeError):
     pass
+
+
+class MissionContactFailure(RuntimeError):
+    def __init__(self, step, contacts, physical_clearance_m):
+        super().__init__(f"physical contact at step {step}")
+        self.step = int(step)
+        self.contacts = contacts
+        self.physical_clearance_m = float(physical_clearance_m)
+
+
+def _numpy(value):
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def physical_body_clearance(pos, quat):
+    """Conservative outer-surface clearance from the real body box to obstacles."""
+    body_half_world = np.abs(R_world_from_body(quat)) @ BODY_HALF_EXTENTS
+    nearest_name = "floor"
+    floor_clearance = float(pos[2] - body_half_world[2])
+    nearest = floor_clearance
+    for name, center, obstacle_half in OBSTACLE_BY_ENTITY.values():
+        axis_gap = np.abs(np.asarray(pos) - center) - (body_half_world + obstacle_half)
+        gap = float(np.linalg.norm(np.maximum(axis_gap, 0.0)))
+        if np.all(axis_gap <= 0.0):
+            gap = -float(np.min(-axis_gap))
+        if gap < nearest:
+            nearest = gap
+            nearest_name = name
+    return nearest, nearest_name
+
+
+def physical_contacts():
+    """Normalize the installed Genesis contact manifold for the drone body."""
+    data = body.get_contacts(exclude_self_contact=True)
+    if not data or len(data.get("geom_a", ())) == 0:
+        return []
+    result = []
+    for index, (geom_a, geom_b) in enumerate(zip(_numpy(data["geom_a"]), _numpy(data["geom_b"]))):
+        geom_a = int(geom_a); geom_b = int(geom_b)
+        body_a = body.geom_start <= geom_a < body.geom_end
+        body_b = body.geom_start <= geom_b < body.geom_end
+        if not (body_a or body_b):
+            continue
+        body_geom, other_geom = (geom_a, geom_b) if body_a else (geom_b, geom_a)
+        other_entity = rs.geoms[other_geom].entity
+        other_idx = int(other_entity.idx)
+        pair = "floor" if other_idx == FLOOR_ENTITY_IDX else OBSTACLE_BY_ENTITY.get(other_idx, (f"entity_{other_idx}",))[0]
+        normal = _numpy(data["normal"])[index].astype(float)
+        if body_b:
+            normal = -normal
+        force_key = "force_a" if body_a else "force_b"
+        result.append({
+            "geom_a": geom_a, "geom_b": geom_b,
+            "pair": f"drone_link0/{pair}", "other_entity": pair,
+            "contact_point": _numpy(data["position"])[index].astype(float).tolist(),
+            "normal": normal.tolist(),
+            "penetration_depth_m": float(_numpy(data["penetration"])[index]),
+            "force_N": float(np.linalg.norm(_numpy(data[force_key])[index])),
+        })
+    return result
+
+
+def physical_acceptance_ok(collision_count, min_physical_clearance_m):
+    return int(collision_count) == 0 and float(min_physical_clearance_m) > SAFETY_HARD_M
 
 
 def frontier_clusters(occ, inf):
@@ -209,10 +294,15 @@ def run_frontier_exploration(record_path=None, live_callback=None, live_interval
     front_log = []
     traj = []
     traj_rtl = []
-    min_clr = float('inf')
+    physical_clr = float('inf')
+    min_physical_clr = float('inf')
+    sensor_range = float('inf')
     collided = False
     collision_count = 0
     unknown_at_step = 0
+    active_contacts = []
+    last_contact = None
+    safety_stop_active = False
 
     def notify(phase, step, pos, rtl_dist=None, force=False):
         if live_callback is None or (not force and step % live_interval != 0):
@@ -225,14 +315,20 @@ def run_frontier_exploration(record_path=None, live_callback=None, live_interval
             "position": np.asarray(pos, dtype=float).copy(),
             "coverage_percent": float(coverage),
             "collision_count": int(collision_count),
-            "min_clearance_m": float(min_clr),
+            "physical_clearance_m": float(physical_clr),
+            "sensor_range_m": float(sensor_range),
+            "active_contact_count": len(active_contacts),
+            "contact_count": int(collision_count),
+            "last_contact": last_contact,
+            "contacts": list(active_contacts),
+            "safety_stop_active": bool(safety_stop_active),
             "unknown_traversal": int(unknown_at_step),
             "frontiers_discovered": len(front_log),
             "selected_frontier": None if best is None else {
                 "x": float(best["cx"]), "y": float(best["cy"]),
             },
             "rtl_distance_m": None if rtl_dist is None else float(rtl_dist),
-            "exploration_path": np.asarray(traj, dtype=float).copy(),
+        "exploration_path": np.asarray(traj, dtype=float).copy(),
             "rtl_path": np.asarray(traj_rtl, dtype=float).copy(),
         })
 
@@ -244,6 +340,20 @@ def run_frontier_exploration(record_path=None, live_callback=None, live_interval
             t_s = last_recorded_t + SIM_DT_S
         recorder.record(t_s, pos, quat, vel, omega, gimbal_state)
         last_recorded_t = t_s
+
+    def update_physical_truth():
+        nonlocal physical_clr, min_physical_clr, active_contacts
+        nonlocal collision_count, collided, last_contact
+        p_now = body.get_pos().cpu().numpy()
+        q_now = body.get_quat().cpu().numpy()
+        physical_clr, _ = physical_body_clearance(p_now, q_now)
+        min_physical_clr = min(min_physical_clr, physical_clr)
+        active_contacts = physical_contacts()
+        if active_contacts:
+            collision_count += len(active_contacts)
+            collided = True
+            last_contact = active_contacts[-1]
+        return p_now, q_now, active_contacts
 
     for i in range(20):
         rs.clear_external_force()
@@ -258,7 +368,10 @@ def run_frontier_exploration(record_path=None, live_callback=None, live_interval
             raise MissionAborted()
         scene.step()
         sim_t += SIM_DT_S
-        notify("BOOTSTRAP", i, body.get_pos().cpu().numpy())
+        p_now, _, contacts = update_physical_truth()
+        notify("CONTACT_FAIL" if contacts else "BOOTSTRAP", i, p_now, force=bool(contacts))
+        if contacts:
+            raise MissionContactFailure(i, contacts, physical_clr)
 
     mx, mxx, my, myy = -2.0, 7.0, -2.0, 5.0
     mapper = OccupancyMapper((mx, mxx, my, myy), 0.08)
@@ -282,7 +395,13 @@ def run_frontier_exploration(record_path=None, live_callback=None, live_interval
 
         df = argus_flood.read(); raw_f = df.distances.cpu().numpy().flatten()
         vf = raw_f[raw_f >= 0]
-        if len(vf) > 0: min_clr = min(min_clr, np.min(vf))
+        if len(vf) > 0: sensor_range = float(np.min(vf))
+        physical_clr, _ = physical_body_clearance(pos, q_cur)
+        min_physical_clr = min(min_physical_clr, physical_clr)
+        safety_stop_active = physical_clr <= SAFETY_WARNING_M
+        if physical_clr <= 0.0:
+            notify("CONTACT_FAIL", 20 + step, pos, force=True)
+            raise MissionContactFailure(step, [], physical_clr)
 
         is_thr = (step % 5 == 0)
         if is_thr:
@@ -314,7 +433,7 @@ def run_frontier_exploration(record_path=None, live_callback=None, live_interval
         if (step >= 300 and state == "EXPLORE" and
                 (step % replan_iv == 0 or step == max_steps - 1)):
             occ = mapper.get_map()
-            inf = inflation_grid(mapper, inflate_r=4)
+            inf = inflation_grid(mapper, inflate_r=math.ceil(SAFETY_WARNING_M / mapper.res))
             cs = frontier_clusters(occ, inf)
             best, cur_path = select_frontier(occ, inf, cs, pos, mapper)
             if best is None:
@@ -382,6 +501,13 @@ def run_frontier_exploration(record_path=None, live_callback=None, live_interval
         else:
             tgt = np.array([pos[0], pos[1], 1.0])
 
+        if safety_stop_active:
+            if state == "FLY_TO_FRONTIER":
+                state = "EXPLORE"; cur_path = []; wp_i = 0
+                if best is not None:
+                    mark_frontier_failed(best["ccx"], best["ccy"], mapper)
+            tgt = np.array([pos[0], pos[1], 1.0])
+
         Tt, qd = position_pd(tgt, pos, vel, yaw_cmd)
         tau, _ = attitude_pd(qd, q_cur, om)
         ts, sat, _, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
@@ -390,21 +516,21 @@ def run_frontier_exploration(record_path=None, live_callback=None, live_interval
             raise MissionAborted()
         scene.step()
         sim_t += SIM_DT_S
-        pos = body.get_pos().cpu().numpy()
+        pos, _, contacts = update_physical_truth()
         mapper.mark_free_cell(pos[0], pos[1])
-        if check_collision(body):
-            collided = True
-            collision_count += 1
         traj.append(pos.copy()); scan_log.append((step, raw_f.copy(), active_state))
         pix_at, piy_at = mapper.w2g(pos[0], pos[1])
         if mapper.in_b(pix_at, piy_at) and mapper.views[piy_at, pix_at] == 0:
             unknown_at_step += 1
         notify("BOOTSTRAP" if step < 300 else "EXPLORE", 20 + step, pos,
                force=state_changed)
+        if contacts:
+            notify("CONTACT_FAIL", 20 + step, pos, force=True)
+            raise MissionContactFailure(20 + step, contacts, physical_clr)
 
     # --- RTL ---
     occ = mapper.get_map()
-    inf = inflation_grid(mapper, inflate_r=4)
+    inf = inflation_grid(mapper, inflate_r=math.ceil(SAFETY_WARNING_M / mapper.res))
     sx, sy = mapper.w2g(pos[0], pos[1])
     gx, gy = mapper.w2g(launch[0], launch[1])
     sx = max(0, min(mapper.w-1, sx)); sy = max(0, min(mapper.h-1, sy))
@@ -423,12 +549,20 @@ def run_frontier_exploration(record_path=None, live_callback=None, live_interval
             qc = body.get_quat().cpu().numpy(); p2 = body.get_pos().cpu().numpy()
             v2 = body.get_vel().cpu().numpy(); om2 = body.get_ang().cpu().numpy()
             record_frame(sim_t, p2, qc, v2, om2)
+            physical_clr, _ = physical_body_clearance(p2, qc)
+            min_physical_clr = min(min_physical_clr, physical_clr)
+            safety_stop_active = physical_clr <= SAFETY_WARNING_M
+            if physical_clr <= 0.0:
+                notify("CONTACT_FAIL", 20 + step + 1 + s2, p2, force=True)
+                raise MissionContactFailure(20 + step + 1 + s2, [], physical_clr)
 
             if wp_i_rtl >= len(pth):
                 tgt2 = launch.copy()
             else:
                 c2x, c2y = mapper.g2w(*pth[wp_i_rtl])
                 tgt2 = np.array([c2x, c2y, 1.0])
+            if safety_stop_active:
+                tgt2 = np.array([p2[0], p2[1], 1.0])
 
             dist = np.linalg.norm(p2[:2] - tgt2[:2])
             speed = np.linalg.norm(v2[:2])
@@ -443,18 +577,18 @@ def run_frontier_exploration(record_path=None, live_callback=None, live_interval
                 raise MissionAborted()
             scene.step()
             sim_t += SIM_DT_S
-            if check_collision(body):
-                collided = True
-                collision_count += 1
+            p2, _, contacts = update_physical_truth()
             df2 = argus_flood.read(); raw_f2 = df2.distances.cpu().numpy().flatten()
             vf2 = raw_f2[raw_f2 >= 0]
-            if len(vf2) > 0: min_clr = min(min_clr, np.min(vf2))
-            p2 = body.get_pos().cpu().numpy()
+            if len(vf2) > 0: sensor_range = float(np.min(vf2))
             v2 = body.get_vel().cpu().numpy()
             mapper.mark_free_cell(p2[0], p2[1])
             traj_rtl.append(p2.copy())
             notify("RTL", 20 + step + 1 + s2, p2,
                    rtl_dist=np.linalg.norm(p2[:2] - launch[:2]), force=s2 == 0)
+            if contacts:
+                notify("CONTACT_FAIL", 20 + step + 1 + s2, p2, force=True)
+                raise MissionContactFailure(20 + step + 1 + s2, contacts, physical_clr)
             if np.linalg.norm(p2[:2] - launch[:2]) < 0.04 and np.linalg.norm(v2[:2]) < 0.1 and s2 > 50:
                 break
 
@@ -491,7 +625,8 @@ def run_frontier_exploration(record_path=None, live_callback=None, live_interval
     print(f"  Unknown traversal: {unknown_at_step} steps")
     print(f"  Oscillation: {oscillation}")
     print(f"  RTL dist: {rtl_d:.4f}, collision: {collided}")
-    print(f"  Min clearance: {min_clr:.4f}")
+    print(f"  Physical clearance: {min_physical_clr:.4f}")
+    print(f"  Forward sensor range: {sensor_range:.4f}")
 
     if recorder:
         recorder.save(record_path)
@@ -503,10 +638,10 @@ def run_frontier_exploration(record_path=None, live_callback=None, live_interval
     ok = True
     r1 = er >= 95.0; ok &= r1
     print(f"  1. Explored >= 95%: {er:.1f}%  {'PASS' if r1 else 'FAIL'}")
-    r2 = not collided; ok &= r2
+    r2 = physical_acceptance_ok(collision_count, min_physical_clr); ok &= r2
     print(f"  2. No collision: {'PASS' if r2 else 'FAIL'}")
-    r3 = min_clr > 0.20; ok &= r3
-    print(f"  3. Clearance > 0.20 m: {min_clr:.4f}  {'PASS' if r3 else 'FAIL'}")
+    r3 = min_physical_clr > SAFETY_HARD_M; ok &= r3
+    print(f"  3. Physical clearance > 0.20 m: {min_physical_clr:.4f}  {'PASS' if r3 else 'FAIL'}")
     r4 = len(front_log) > 0; ok &= r4
     print(f"  4. Frontiers found: {len(front_log)}  {'PASS' if r4 else 'FAIL'}")
     r5 = rtl_d < 0.05; ok &= r5
@@ -538,9 +673,12 @@ def run_frontier_exploration(record_path=None, live_callback=None, live_interval
         "rtl_trajectory": np.asarray(traj_rtl),
         "frontiers": front_log,
         "both_legs": bool(both_legs),
-        "min_clearance": float(min_clr),
+        "min_clearance": float(min_physical_clr),
+        "physical_clearance_m": float(min_physical_clr),
+        "sensor_range_m": float(sensor_range),
         "collision": bool(collided),
         "collision_count": int(collision_count),
+        "last_contact": last_contact,
         "unknown_traversal": int(unknown_at_step),
         "oscillation": bool(oscillation),
         "terminated_no_frontier": "NO_FRONTIER" in [d[1] for d in dec],

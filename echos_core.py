@@ -353,8 +353,9 @@ def check_collision(body, body_h=BODY_H):
     try:
         contacts = body.get_contacts(exclude_self_contact=True)
         if contacts is not None:
-            geom_a = contacts.get("geom_a", [])
-            if len(geom_a) > 0:
+            geom_a = np.asarray(contacts.get("geom_a", []))
+            geom_b = np.asarray(contacts.get("geom_b", []))
+            if geom_a.size > 0 or geom_b.size > 0:
                 return True
     except Exception as e:
         raise RuntimeError(f"check_collision: body.get_contacts() failed: {e}") from e

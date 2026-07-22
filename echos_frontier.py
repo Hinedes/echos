@@ -229,7 +229,8 @@ def run_frontier_exploration(record_path=None):
             state = "EXPLORE"; state_changed = True
 
         # Replan
-        if step >= 300 and state == "EXPLORE" and step % replan_iv == 0:
+        if (step >= 300 and state == "EXPLORE" and
+                (step % replan_iv == 0 or step == max_steps - 1)):
             occ = mapper.get_map()
             inf = inflation_grid(mapper, inflate_r=4)
             cs = frontier_clusters(occ, inf)

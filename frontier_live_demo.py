@@ -55,13 +55,20 @@ class LiveState:
         self.lock = threading.Condition()
         self.frame = None
         self.frame_seq = 0
-        self.telemetry = {
-            "run_uuid": run_uuid, "seed": seed, "backend": backend,
-            "gpu": gpu, "phase": "BOOTSTRAP", "wall_clock_utc": utc_now(),
-        }
+        self.telemetry = {"run_uuid": run_uuid, "seed": seed, "backend": backend,
+                          "gpu": gpu, "phase": "IDLE", "step": 0,
+                          "sim_time_s": 0.0, "mission_started": False,
+                          "paused": False, "control_state": "WAITING_FOR_START",
+                          "wall_clock_utc": utc_now()}
         self.logs = deque(maxlen=300)
         self.final = None
         self.done = False
+        self.started = False
+        self.paused = False
+        self.abort_requested = False
+        self.camera_name = "overhead"
+        self.start_callback = None
+        self.shutdown_event = threading.Event()
         self.log_path = self.output_dir / "mission.log"
         self.log_file = self.log_path.open("w", encoding="utf-8", buffering=1)
 
@@ -82,6 +89,9 @@ class LiveState:
             self.telemetry["backend"] = self.backend
             self.telemetry["gpu"] = self.gpu
             self.telemetry["wall_clock_utc"] = utc_now()
+            self.telemetry["paused"] = self.paused
+            self.telemetry["control_state"] = "PAUSED" if self.paused else self.telemetry.get("phase", "IDLE")
+            self.telemetry["camera"] = self.camera_name
             self.frame = frame
             self.frame_seq += 1
             self.telemetry["frame_seq"] = self.frame_seq
@@ -90,30 +100,86 @@ class LiveState:
     def finish(self, report):
         with self.lock:
             self.final = report
+            phase = "ABORTED" if report.get("aborted") else "COMPLETE"
             self.telemetry.update({
-                "phase": "COMPLETE",
+                "phase": phase,
                 "mission_passed": report["mission_passed"],
+                "control_state": phase,
                 "final": report,
             })
             self.done = True
             self.lock.notify_all()
-        self.log("COMPLETE mission_passed=%s localization_error_m=%.6f" % (
-            report["mission_passed"], report["localization_error_m"]))
+        message = "ABORTED" if report.get("aborted") else "COMPLETE"
+        if "localization_error_m" in report:
+            message += " mission_passed=%s localization_error_m=%.6f" % (
+                report["mission_passed"], report["localization_error_m"])
+        self.log(message)
 
     def snapshot(self):
         with self.lock:
             result = dict(self.telemetry)
+            result["wall_clock_utc"] = utc_now()
+            result["paused"] = self.paused
+            result["control_state"] = "PAUSED" if self.paused else result.get("control_state", "IDLE")
+            result["camera"] = self.camera_name
             result["logs"] = list(self.logs)
             result["final_available"] = self.final is not None
             return result
 
     def wait_frame(self, previous_seq):
         with self.lock:
-            while self.frame_seq <= previous_seq and not self.done:
+            while self.frame_seq <= previous_seq and not self.shutdown_event.is_set():
                 self.lock.wait(timeout=1.0)
-            return self.frame, self.frame_seq, self.done
+            return self.frame, self.frame_seq, self.shutdown_event.is_set()
+
+    def start(self):
+        with self.lock:
+            if self.started:
+                return False
+            self.started = True
+            self.telemetry.update({"phase": "BOOTSTRAP", "mission_started": True,
+                                   "control_state": "BOOTSTRAP"})
+            callback = self.start_callback
+        self.log("START_REQUEST accepted")
+        callback()
+        return True
+
+    def set_paused(self, paused):
+        with self.lock:
+            if not self.started or self.done:
+                return False
+            if self.paused == paused:
+                return True
+            self.paused = paused
+            self.lock.notify_all()
+        self.log("PAUSE_REQUEST" if paused else "RESUME_REQUEST")
+        return True
+
+    def abort(self):
+        with self.lock:
+            if not self.started or self.done:
+                return False
+            self.abort_requested = True
+            self.paused = False
+            self.lock.notify_all()
+        self.log("ABORT_REQUEST accepted")
+        return True
+
+    def step_guard(self):
+        with self.lock:
+            while self.paused and not self.abort_requested:
+                self.lock.wait(timeout=0.5)
+            return not self.abort_requested
+
+    def set_camera(self, name):
+        with self.lock:
+            self.camera_name = name
+            self.telemetry["camera"] = name
 
     def close(self):
+        self.shutdown_event.set()
+        with self.lock:
+            self.lock.notify_all()
         self.log_file.close()
 
 
@@ -132,6 +198,16 @@ class LiveRenderer:
         self.font = ImageFont.load_default()
         self.last_phase = None
         self.last_frontier = None
+        self.last_event = None
+        self.last_estimate = None
+        self.last_error = None
+        self.last_gates = None
+        self.heartbeat = False
+        self.render_lock = threading.Lock()
+        self.camera_poses = (
+            ((3.0, -7.5, 8.5), (2.7, 1.0, 0.0)),
+            ((7.5, 5.5, 6.0), (2.5, 1.0, 0.6)),
+        )
 
     @staticmethod
     def _path(path, limit=700):
@@ -172,10 +248,12 @@ class LiveRenderer:
         draw = self.ImageDraw.Draw(image, "RGBA")
         lines = [
             f"RUN {self.state.run_uuid}  SEED {self.state.seed}",
+            f"FRAME {self.state.frame_seq + 1}  HEARTBEAT {'|' if self.heartbeat else '/'}",
             f"UTC {utc_now()}",
             f"STEP {event['step']}  SIM {event['sim_time_s']:.2f}s",
             f"BACKEND {self.state.backend}  GPU {self.state.gpu}",
             f"PHASE {event['phase']}",
+            f"CONTROL {'PAUSED' if self.state.paused else self.state.telemetry.get('control_state', 'RUNNING')}",
             "POS (%.3f, %.3f, %.3f)" % tuple(event["position"]),
             "FRONTIER " + ("none" if event["selected_frontier"] is None else
                             "(%.2f, %.2f)" % (event["selected_frontier"]["x"],
@@ -188,7 +266,7 @@ class LiveRenderer:
             "ARGUS EST " + ("--" if estimate is None else "(%.3f, %.3f, %.3f)" % tuple(estimate)),
             "ARGUS ERROR " + ("--" if error is None else f"{error:.4f}m"),
         ]
-        if gates:
+        if gates and event["phase"] == "COMPLETE":
             lines.append("ACCEPTANCE " + ("PASS" if gates["mission_passed"] else "FAIL"))
         width = max(draw.textbbox((0, 0), line, font=self.font)[2] for line in lines) + 18
         draw.rectangle((5, 5, width, 11 + len(lines) * 15), fill=(0, 0, 0, 190))
@@ -198,6 +276,15 @@ class LiveRenderer:
         return np.asarray(image)
 
     def render(self, event, estimate=None, error=None, gates=None):
+        with self.render_lock:
+            self._render(event, estimate, error, gates)
+
+    def _render(self, event, estimate=None, error=None, gates=None):
+        self.last_event = dict(event)
+        self.last_estimate = None if estimate is None else np.asarray(estimate, dtype=float).copy()
+        self.last_error = error
+        self.last_gates = gates
+        self.heartbeat = not self.heartbeat
         self._debug_geometry(event, estimate)
         rgb = self.camera.render(rgb=True, force_render=True)[0]
         if hasattr(rgb, "cpu"):
@@ -237,9 +324,24 @@ class LiveRenderer:
             self.last_frontier = frontier
         time.sleep(self.pace_s * (20 if event["phase"] == "NO_FRONTIER" else 1))
 
+    def render_heartbeat(self):
+        if self.last_event is None:
+            return
+        self.render(self.last_event, self.last_estimate, self.last_error, self.last_gates)
+
+    def toggle_camera(self):
+        with self.render_lock:
+            index = 1 if self.state.camera_name == "overhead" else 0
+            pos, lookat = self.camera_poses[index]
+            self.camera.set_pose(pos=pos, lookat=lookat, up=(0.0, 0.0, 1.0))
+            self.state.set_camera("alternate" if index else "overhead")
+            if self.last_event is not None:
+                self._render(self.last_event, self.last_estimate, self.last_error, self.last_gates)
+
 
 class DashboardHandler(BaseHTTPRequestHandler):
     state = None
+    renderer = None
 
     def log_message(self, *_args):
         return
@@ -269,6 +371,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.artifact(path[len("/artifacts/"):])
         else:
             self._send("not found\n", "text/plain", 404)
+
+    def do_POST(self):
+        path = unquote(urlparse(self.path).path)
+        actions = {
+            "/control/start": lambda: self.state.start(),
+            "/control/pause": lambda: self.state.set_paused(True),
+            "/control/resume": lambda: self.state.set_paused(False),
+            "/control/abort": lambda: self.state.abort(),
+            "/control/camera": lambda: (self.renderer.toggle_camera() or True),
+        }
+        action = actions.get(path)
+        if action is None:
+            self._send(json.dumps({"ok": False, "error": "not found"}), "application/json", 404)
+            return
+        try:
+            changed = action()
+            self._send(json.dumps({"ok": True, "changed": bool(changed)}), "application/json")
+        except Exception as exc:
+            self._send(json.dumps({"ok": False, "error": str(exc)}), "application/json", 500)
 
     def stream(self):
         self.send_response(200)
@@ -310,16 +431,46 @@ class DashboardHandler(BaseHTTPRequestHandler):
 DASHBOARD_HTML = """<!doctype html>
 <html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Genesis Frontier Live Proof</title>
-<style>body{background:#101318;color:#e9edf1;font:14px monospace;margin:16px}main{display:grid;grid-template-columns:minmax(480px,2fr) minmax(300px,1fr);gap:16px}img{width:100%;background:#000;border:1px solid #39414d}pre{white-space:pre-wrap;background:#171c24;padding:12px;overflow:auto;max-height:360px}h1{font-size:20px}.pass{color:#7dff98}.fail{color:#ff7777}@media(max-width:900px){main{display:block}}</style></head>
-<body><h1>Genesis Frontier Live Proof</h1><main><section><img src="/stream.mjpg"><h2>Mission Log</h2><pre id="logs">waiting for mission...</pre></section>
+<style>body{background:#101318;color:#e9edf1;font:14px monospace;margin:16px}main{display:grid;grid-template-columns:minmax(480px,2fr) minmax(300px,1fr);gap:16px}img{width:100%;background:#000;border:1px solid #39414d}pre{white-space:pre-wrap;background:#171c24;padding:12px;overflow:auto;max-height:360px}h1{font-size:20px}button{background:#2b6cff;color:white;border:0;border-radius:4px;padding:9px 13px;margin:3px;font:inherit;cursor:pointer}button:disabled{background:#444;cursor:not-allowed}.control{padding:8px 0}@media(max-width:900px){main{display:block}}</style></head>
+<body><h1>Genesis Frontier Live Proof</h1>
+<div class="control"><button id="start">Start mission</button><button id="pause">Pause simulation</button><button id="resume">Resume simulation</button><button id="abort">Abort</button><button id="camera">Move camera</button><span id="action">WAITING FOR START</span></div>
+<main><section><img id="stream" src="/stream.mjpg" alt="live Genesis camera"><h2>Mission Log</h2><pre id="logs">waiting for mission...</pre></section>
 <section><h2>Telemetry</h2><pre id="telemetry">connecting...</pre><h2>Final Gates</h2><pre id="gates">pending...</pre><h2>Artifacts</h2><ul id="artifacts"></ul></section></main>
 <script>
-const names=['final.json','frontier_argus_demo.json','frontier_trajectory.npz','frontier_maps.npz','occupancy_map.pgm','sound_heatmap.pgm','frontier_argus_demo.svg','mission.log'];
-document.getElementById('artifacts').innerHTML=names.map(n=>`<li><a href="/artifacts/${n}">${n}</a></li>`).join('');
-async function poll(){try{const s=await (await fetch('/status.json',{cache:'no-store'})).json();
-document.getElementById('telemetry').textContent=JSON.stringify(s,null,2); document.getElementById('logs').textContent=(s.logs||[]).join('\n'); const l=document.getElementById('logs'); l.scrollTop=l.scrollHeight;
-if(s.final_available){const f=await (await fetch('/final.json',{cache:'no-store'})).json(); document.getElementById('gates').textContent=JSON.stringify(f.acceptance_gates||f,null,2); document.title=(f.mission_passed?'PASS':'FAIL')+' - Genesis Frontier';}}
-catch(e){document.getElementById('telemetry').textContent='server unavailable: '+e;} } setInterval(poll,500); poll();
+(function () {
+  var names = ['final.json','frontier_argus_demo.json','frontier_trajectory.npz','frontier_maps.npz','occupancy_map.pgm','sound_heatmap.pgm','frontier_argus_demo.svg','mission.log'];
+  var ids = {telemetry: document.getElementById('telemetry'), logs: document.getElementById('logs'), gates: document.getElementById('gates'), action: document.getElementById('action')};
+  var buttons = {start: document.getElementById('start'), pause: document.getElementById('pause'), resume: document.getElementById('resume'), abort: document.getElementById('abort'), camera: document.getElementById('camera')};
+  document.getElementById('artifacts').innerHTML = names.map(function (n) { return '<li><a href="/artifacts/' + n + '">' + n + '</a></li>'; }).join('');
+  function control(path) {
+    fetch(path, {method: 'POST', cache: 'no-store'}).then(function () { poll(); }).catch(function (e) { ids.action.textContent = String(e); });
+  }
+  buttons.start.onclick = function () { control('/control/start'); };
+  buttons.pause.onclick = function () { control('/control/pause'); };
+  buttons.resume.onclick = function () { control('/control/resume'); };
+  buttons.abort.onclick = function () { control('/control/abort'); };
+  buttons.camera.onclick = function () { control('/control/camera'); };
+  function poll() {
+    fetch('/status.json?ts=' + Date.now(), {cache: 'no-store'}).then(function (response) { return response.json(); }).then(function (s) {
+      ids.telemetry.textContent = JSON.stringify(s, null, 2);
+      ids.logs.textContent = (s.logs || []).join(String.fromCharCode(10));
+      ids.logs.scrollTop = ids.logs.scrollHeight;
+      ids.action.textContent = s.control_state || s.phase;
+      buttons.start.disabled = s.mission_started || s.final_available;
+      buttons.pause.disabled = !s.mission_started || s.paused || s.final_available;
+      buttons.resume.disabled = !s.mission_started || !s.paused || s.final_available;
+      buttons.abort.disabled = !s.mission_started || s.final_available;
+      if (s.final_available) {
+        fetch('/final.json?ts=' + Date.now(), {cache: 'no-store'}).then(function (response) { return response.json(); }).then(function (f) {
+          ids.gates.textContent = JSON.stringify(f.acceptance_gates || f, null, 2);
+          document.title = (f.mission_passed ? 'PASS' : 'FAIL') + ' - Genesis Frontier';
+        });
+      }
+    }).catch(function (e) { ids.telemetry.textContent = 'status error: ' + String(e); });
+  }
+  setInterval(poll, 500);
+  poll();
+}());
 </script></body></html>"""
 
 
@@ -433,11 +584,7 @@ def main():
     backend = os.environ["ECHOS_GENESIS_BACKEND"]
     gpu = gpu_name()
 
-    from echos_frontier import run_frontier_exploration
-    from replay_argus import replay
-
     state = LiveState(output_dir, run_uuid, args.seed, backend, gpu)
-    renderer = LiveRenderer(state, SOUND_SOURCE_WORLD, args.pace)
     DashboardHandler.state = state
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -451,6 +598,20 @@ def main():
         else:
             print("Tailnet URL: unavailable; run tailscale serve %d" % args.port, flush=True)
 
+    from echos_frontier import MissionAborted, run_frontier_exploration
+    from replay_argus import replay
+
+    renderer = LiveRenderer(state, SOUND_SOURCE_WORLD, args.pace)
+    DashboardHandler.renderer = renderer
+    renderer.render({
+        "phase": "IDLE", "step": 0, "sim_time_s": 0.0,
+        "position": np.array([0.0, 0.0, 1.0]), "coverage_percent": 0.0,
+        "collision_count": 0, "min_clearance_m": float("inf"),
+        "unknown_traversal": 0, "frontiers_discovered": 0,
+        "selected_frontier": None, "rtl_distance_m": None,
+        "exploration_path": np.empty((0, 3)), "rtl_path": np.empty((0, 3)),
+    })
+
     last_phase = [None]
 
     def on_event(event):
@@ -460,10 +621,12 @@ def main():
         renderer.render(event)
 
     trajectory_path = output_dir / "frontier_trajectory.npz"
-    try:
+    def mission_worker():
+      try:
         mission = run_frontier_exploration(record_path=trajectory_path,
                                             live_callback=on_event,
-                                            live_interval=args.render_every)
+                                            live_interval=args.render_every,
+                                            step_guard=state.step_guard)
         state.log("REPLAY ARGUS starting")
         estimate, truth = replay(str(trajectory_path), target=SOUND_SOURCE_WORLD)
         error = float(np.linalg.norm(estimate - truth))
@@ -485,13 +648,31 @@ def main():
         state.finish(report)
         state.log(f"FINAL_JSON {output_dir / 'final.json'}")
         if not report["mission_passed"]:
-            raise SystemExit(1)
+            state.log("MISSION FAIL final dashboard retained")
+            return
         state.log("SERVER_RETAINED final dashboard is available until process exit")
-        while True:
-            time.sleep(1.0)
-    except Exception as exc:
+      except MissionAborted:
+        report = {"run_uuid": run_uuid, "seed": args.seed, "backend": backend,
+                  "gpu": gpu, "aborted": True, "mission_passed": False,
+                  "acceptance_gates": {}}
+        state.finish(report)
+        state.log("ABORTED final dashboard retained")
+      except Exception as exc:
         state.log(f"FAIL {type(exc).__name__}: {exc}")
-        raise
+
+    state.start_callback = lambda: threading.Thread(target=mission_worker, daemon=True).start()
+
+    def paused_heartbeat():
+        while not state.shutdown_event.wait(0.5):
+            if state.started and state.paused and not state.done:
+                renderer.render_heartbeat()
+
+    threading.Thread(target=paused_heartbeat, daemon=True).start()
+    try:
+        while not state.shutdown_event.wait(1.0):
+            pass
+    except KeyboardInterrupt:
+        state.log("SERVER_STOP requested")
     finally:
         server.shutdown()
         state.close()

@@ -40,6 +40,10 @@ li = 0
 SIM_DT_S = 0.01
 
 
+class MissionAborted(RuntimeError):
+    pass
+
+
 def frontier_clusters(occ, inf):
     h, w = occ.shape
     fg = np.zeros((h, w), dtype=np.int32)
@@ -186,7 +190,8 @@ def reachable_coverage(mapper, launch):
     return reachable, (covered / len(reachable) * 100 if reachable else 0.0)
 
 
-def run_frontier_exploration(record_path=None, live_callback=None, live_interval=5):
+def run_frontier_exploration(record_path=None, live_callback=None, live_interval=5,
+                             step_guard=None):
     print("\n" + "="*50)
     print("  Autonomous Frontier Exploration")
     print("="*50)
@@ -249,6 +254,8 @@ def run_frontier_exploration(record_path=None, live_callback=None, live_interval
         tau, _ = attitude_pd(qd, qc, om)
         ts, sat, _, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
         apply_rotor_forces(rs, li, ts)
+        if step_guard is not None and not step_guard():
+            raise MissionAborted()
         scene.step()
         sim_t += SIM_DT_S
         notify("BOOTSTRAP", i, body.get_pos().cpu().numpy())
@@ -379,6 +386,8 @@ def run_frontier_exploration(record_path=None, live_callback=None, live_interval
         tau, _ = attitude_pd(qd, q_cur, om)
         ts, sat, _, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
         apply_rotor_forces(rs, li, ts)
+        if step_guard is not None and not step_guard():
+            raise MissionAborted()
         scene.step()
         sim_t += SIM_DT_S
         pos = body.get_pos().cpu().numpy()
@@ -430,6 +439,8 @@ def run_frontier_exploration(record_path=None, live_callback=None, live_interval
             tau, _ = attitude_pd(qd, qc, om2)
             ts, sat, _, _ = mixer_with_authority(Tt, tau[0], tau[1], tau[2])
             apply_rotor_forces(rs, li, ts)
+            if step_guard is not None and not step_guard():
+                raise MissionAborted()
             scene.step()
             sim_t += SIM_DT_S
             if check_collision(body):

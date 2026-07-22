@@ -526,6 +526,7 @@ def run_frontier_exploration(record_path=None, live_callback=None, live_interval
         "trajectory": np.asarray(traj),
         "rtl_trajectory": np.asarray(traj_rtl),
         "frontiers": front_log,
+        "both_legs": bool(both_legs),
         "min_clearance": float(min_clr),
         "collision": bool(collided),
         "collision_count": int(collision_count),

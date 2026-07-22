@@ -6,6 +6,7 @@ import json
 import os
 import random
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -324,7 +325,9 @@ catch(e){document.getElementById('telemetry').textContent='server unavailable: '
 
 def enable_tailscale(port):
     candidates = ["tailscale", "/mnt/c/Program Files/Tailscale/tailscale.exe"]
-    command = next((path for path in candidates if Path(path).exists() or path == "tailscale"), None)
+    command = next((path for path in candidates if (
+        shutil.which(path) if path == "tailscale" else Path(path).exists()
+    )), None)
     if command is None:
         return None
     result = subprocess.run([command, "serve", "--bg", str(port)], capture_output=True,

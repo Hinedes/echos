@@ -76,10 +76,12 @@ def frontier_clusters(occ, inf):
 
 
 failed_frontiers = set()
+completed_frontiers = set()
 
 def clear_failed_frontiers():
-    global failed_frontiers
+    global failed_frontiers, completed_frontiers
     failed_frontiers = set()
+    completed_frontiers = set()
 
 def mark_frontier_failed(ccx, ccy, mapper):
     global failed_frontiers
@@ -87,7 +89,7 @@ def mark_frontier_failed(ccx, ccy, mapper):
     failed_frontiers.add(((round(ccx), round(ccy)), rev))
 
 def select_frontier(occ, inf, cs, cur_pos, mapper):
-    global failed_frontiers
+    global failed_frontiers, completed_frontiers
     map_revision = int(np.sum(mapper.views))
     sx, sy = mapper.w2g(cur_pos[0], cur_pos[1])
     best = None; bs = -1; cur_path = None
@@ -98,6 +100,8 @@ def select_frontier(occ, inf, cs, cur_pos, mapper):
         ccx = sum(c[0] for c in cells) / len(cells)
         ccy = sum(c[1] for c in cells) / len(cells)
         cx_r, cy_r = round(ccx), round(ccy)
+        if (cx_r, cy_r) in completed_frontiers:
+            continue
         if ((cx_r, cy_r), map_revision) in failed_frontiers:
             continue
 
@@ -261,6 +265,7 @@ def run_frontier_exploration(record_path=None):
                 scan_steps += 1
             elif yaw_aligned and scan_steps >= 30:
                 state = "EXPLORE"; state_changed = True
+                completed_frontiers.add((best["ccx"], best["ccy"]))
                 print(f"    scan complete ({scan_steps} steps)")
             elif align_steps >= 200:
                 state = "EXPLORE"; state_changed = True
@@ -298,6 +303,7 @@ def run_frontier_exploration(record_path=None):
         scene.step()
         sim_t += SIM_DT_S
         pos = body.get_pos().cpu().numpy()
+        mapper.mark_free_cell(pos[0], pos[1])
         if check_collision(body): collided = True
         traj.append(pos.copy()); scan_log.append((step, raw_f.copy(), active_state))
         pix_at, piy_at = mapper.w2g(pos[0], pos[1])
@@ -312,6 +318,7 @@ def run_frontier_exploration(record_path=None):
     sx = max(0, min(mapper.w-1, sx)); sy = max(0, min(mapper.h-1, sy))
     gx = max(0, min(mapper.w-1, gx)); gy = max(0, min(mapper.h-1, gy))
 
+    traj_rtl = []
     pth = astar_path(inf, (sx, sy), (gx, gy))
     if pth is None:
         print(f"  RTL FAILED: no path from ({sx},{sy}) to ({gx},{gy})")
@@ -349,6 +356,7 @@ def run_frontier_exploration(record_path=None):
             if len(vf2) > 0: min_clr = min(min_clr, np.min(vf2))
             p2 = body.get_pos().cpu().numpy()
             v2 = body.get_vel().cpu().numpy()
+            mapper.mark_free_cell(p2[0], p2[1])
             traj_rtl.append(p2.copy())
             if np.linalg.norm(p2[:2] - launch[:2]) < 0.04 and np.linalg.norm(v2[:2]) < 0.1 and s2 > 50:
                 break

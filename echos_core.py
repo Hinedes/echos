@@ -268,6 +268,13 @@ class OccupancyMapper:
                 self.log_odds[cy, cx] -= FREE_WEIGHT
             self.views[cy, cx] += 1
 
+    def mark_free_cell(self, x, y):
+        """Record the vehicle's own cell as observed free space."""
+        ix, iy = self.w2g(x, y)
+        if self.in_b(ix, iy) and self.hits[iy, ix] == 0:
+            self.log_odds[iy, ix] = min(self.log_odds[iy, ix], -FREE_WEIGHT)
+            self.views[iy, ix] += 1
+
     def get_map(self):
         occ = np.zeros((self.h, self.w))
         occ[(self.log_odds > 0) & (self.hits >= 1)] = 1.0
